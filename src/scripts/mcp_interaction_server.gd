@@ -9,7 +9,13 @@ var _client: StreamPeerTCP
 var _buffer: String = ""
 var _busy: bool = false
 var _busy_since: float = 0.0
-const PORT: int = 9090
+# Port resolution: env var GODOT_MCP_PORT wins (explicit, no fallback);
+# otherwise scan BASE_PORT..BASE_PORT+PORT_SCAN_RANGE-1 so multiple Godot games
+# can run side-by-side without colliding. The godot-mcp Node server reads the
+# same env var to pick which instance to connect to.
+const BASE_PORT: int = 9090
+const PORT_SCAN_RANGE: int = 10
+var _bound_port: int = -1
 const BUSY_TIMEOUT: float = 30.0
 var _key_map: Dictionary
 var _held_keys: Dictionary = {}
@@ -19,11 +25,31 @@ func _ready() -> void:
 	process_mode = Node.PROCESS_MODE_ALWAYS
 	_init_key_map()
 	_server = TCPServer.new()
-	var err: int = _server.listen(PORT, "127.0.0.1")
-	if err != OK:
-		push_error("McpInteractionServer: Failed to listen on port %d, error: %d" % [PORT, err])
+	_bound_port = _resolve_port()
+	if _bound_port < 0:
 		return
-	print("McpInteractionServer: Listening on 127.0.0.1:%d" % PORT)
+	print("McpInteractionServer: Listening on 127.0.0.1:%d (pid=%d)" % [_bound_port, OS.get_process_id()])
+
+
+# Returns the bound port, or -1 on failure. Priority: GODOT_MCP_PORT env var
+# (explicit, fails loudly if busy), then auto-scan BASE_PORT..BASE_PORT+PORT_SCAN_RANGE-1.
+func _resolve_port() -> int:
+	var env_port_str: String = OS.get_environment("GODOT_MCP_PORT")
+	if env_port_str.length() > 0:
+		var requested: int = env_port_str.to_int()
+		if requested > 0:
+			var env_err: int = _server.listen(requested, "127.0.0.1")
+			if env_err == OK:
+				return requested
+			push_error("McpInteractionServer: GODOT_MCP_PORT=%d busy, error: %d (explicit override does not fall back)" % [requested, env_err])
+			return -1
+		push_warning("McpInteractionServer: GODOT_MCP_PORT='%s' is not a positive integer, falling back to auto-scan" % env_port_str)
+	for port: int in range(BASE_PORT, BASE_PORT + PORT_SCAN_RANGE):
+		var err: int = _server.listen(port, "127.0.0.1")
+		if err == OK:
+			return port
+	push_error("McpInteractionServer: no free port in %d..%d" % [BASE_PORT, BASE_PORT + PORT_SCAN_RANGE - 1])
+	return -1
 
 
 func _process(_delta: float) -> void:

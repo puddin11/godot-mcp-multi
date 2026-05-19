@@ -12,7 +12,7 @@ import { join, dirname, basename, normalize } from 'path';
 import { existsSync, readdirSync, readFileSync, writeFileSync, copyFileSync, unlinkSync, mkdirSync, renameSync } from 'fs';
 import { spawn, execFile } from 'child_process';
 import { promisify } from 'util';
-import { createConnection, Socket } from 'net';
+import { createConnection, createServer, Socket } from 'net';
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
@@ -94,10 +94,43 @@ class GodotServer {
   };
   private lastErrorIndex: number = 0;
   private lastLogIndex: number = 0;
-  private readonly INTERACTION_PORT = 9090;
+  // Port for talking to the game's interaction server.
+  // Resolution order at run_project time:
+  //   1. GODOT_MCP_PORT env var set on the godot-mcp process — used verbatim, no auto-pick.
+  //   2. Otherwise auto-pick a free port in BASE_PORT..BASE_PORT+PORT_SCAN_RANGE-1,
+  //      inject GODOT_MCP_PORT into the spawned Godot process's environment.
+  // This lets multiple Claude sessions each get an isolated Godot game instance
+  // without manual per-session port configuration. The bundled autoload picks
+  // the same env var; if the autoload's auto-scan picks a different port
+  // (e.g. due to a race), we parse the "Listening on 127.0.0.1:NNNN" log line
+  // and update interactionPort to match.
+  private static readonly BASE_PORT = 9090;
+  private static readonly PORT_SCAN_RANGE = 10;
+  private interactionPort: number;
+  private interactionPortLocked: boolean;
   private readonly AUTOLOAD_NAME = 'McpInteractionServer';
 
   constructor(config?: GodotServerConfig) {
+    // Resolve interaction-server port. Explicit GODOT_MCP_PORT env var locks
+    // the port (no auto-pick at run_project time); absence falls through to
+    // auto-pick. See INTERACTION_PORT comment for full priority order.
+    const rawPort = process.env.GODOT_MCP_PORT;
+    if (rawPort) {
+      const parsed = parseInt(rawPort, 10);
+      if (!Number.isNaN(parsed) && parsed >= 1 && parsed <= 65535) {
+        this.interactionPort = parsed;
+        this.interactionPortLocked = true;
+        console.error(`[SERVER] GODOT_MCP_PORT=${parsed} set explicitly, will not auto-pick`);
+      } else {
+        console.error(`[SERVER] GODOT_MCP_PORT='${rawPort}' is not a valid port (1-65535), falling back to auto-pick`);
+        this.interactionPort = GodotServer.BASE_PORT;
+        this.interactionPortLocked = false;
+      }
+    } else {
+      this.interactionPort = GodotServer.BASE_PORT;
+      this.interactionPortLocked = false;
+    }
+
     // Apply configuration if provided
     let debugMode = DEBUG_MODE;
     let godotDebugMode = GODOT_DEBUG_MODE;
@@ -418,12 +451,12 @@ class GodotServer {
 
       try {
         await new Promise<void>((resolve, reject) => {
-          const socket = createConnection({ host: '127.0.0.1', port: this.INTERACTION_PORT }, () => {
+          const socket = createConnection({ host: '127.0.0.1', port: this.interactionPort }, () => {
             this.gameConnection.socket = socket;
             this.gameConnection.connected = true;
             this.gameConnection.responseBuffer = '';
             this.logDebug(`Connected to game interaction server (attempt ${attempt})`);
-            console.error(`[SERVER] Connected to game interaction server on port ${this.INTERACTION_PORT}`);
+            console.error(`[SERVER] Connected to game interaction server on port ${this.interactionPort}`);
 
             socket.on('data', (data: Buffer) => {
               this.gameConnection.responseBuffer += data.toString();
@@ -476,6 +509,32 @@ class GodotServer {
     }
 
     console.error(`[SERVER] Failed to connect to game interaction server after ${maxAttempts} attempts`);
+  }
+
+  /**
+   * Probe if a TCP port on 127.0.0.1 is currently free. Briefly opens and closes
+   * a listener; not race-free, but good enough for sequential port picking.
+   */
+  private isPortFree(port: number): Promise<boolean> {
+    return new Promise((resolve) => {
+      const probe = createServer();
+      probe.once('error', () => resolve(false));
+      probe.once('listening', () => {
+        probe.close(() => resolve(true));
+      });
+      probe.listen(port, '127.0.0.1');
+    });
+  }
+
+  /**
+   * Scan BASE_PORT..BASE_PORT+PORT_SCAN_RANGE-1 and return the first free port.
+   * Returns null if every port in range is busy.
+   */
+  private async findFreePort(): Promise<number | null> {
+    for (let port = GodotServer.BASE_PORT; port < GodotServer.BASE_PORT + GodotServer.PORT_SCAN_RANGE; port++) {
+      if (await this.isPortFree(port)) return port;
+    }
+    return null;
   }
 
   /**
@@ -3636,22 +3695,54 @@ class GodotServer {
       // Inject interaction server before launching
       this.injectInteractionServer(args.projectPath);
 
+      // Pick a free port for this game instance unless the user pinned one via
+      // GODOT_MCP_PORT on the godot-mcp process itself. Inject the chosen port
+      // into the spawned game's environment so the autoload binds the matching
+      // port. This is what makes parallel Claude sessions safe — each spawns
+      // its own game on its own port without manual config.
+      if (!this.interactionPortLocked) {
+        const free = await this.findFreePort();
+        if (free !== null) {
+          if (free !== this.interactionPort) {
+            this.logDebug(`Auto-picked interaction port ${free} (was ${this.interactionPort})`);
+            this.interactionPort = free;
+          }
+        } else {
+          console.error(`[SERVER] No free port in ${GodotServer.BASE_PORT}..${GodotServer.BASE_PORT + GodotServer.PORT_SCAN_RANGE - 1}, attempting with ${this.interactionPort} (likely to fail)`);
+        }
+      }
+      const spawnEnv = { ...globalThis.process.env, GODOT_MCP_PORT: String(this.interactionPort) };
+
       const cmdArgs = ['-d', '--path', args.projectPath];
       if (args.scene && validatePath(args.scene)) {
         this.logDebug(`Adding scene parameter: ${args.scene}`);
         cmdArgs.push(args.scene);
       }
 
-      this.logDebug(`Running Godot project: ${args.projectPath}`);
-      const process = spawn(this.godotPath!, cmdArgs, { stdio: 'pipe' });
+      this.logDebug(`Running Godot project: ${args.projectPath} on port ${this.interactionPort}`);
+      const process = spawn(this.godotPath!, cmdArgs, { stdio: 'pipe', env: spawnEnv });
       const output: string[] = [];
       const errors: string[] = [];
+
+      // Recognise the autoload's startup log so we learn the port the game
+      // actually bound (covers races where two godot-mcp processes raced for
+      // the same free port — the autoload auto-scans, so the real port may
+      // differ from what we asked for).
+      const listeningRegex = /McpInteractionServer: Listening on 127\.0\.0\.1:(\d+)/;
 
       process.stdout?.on('data', (data: Buffer) => {
         const lines = data.toString().split('\n');
         output.push(...lines);
         lines.forEach((line: string) => {
           if (line.trim()) this.logDebug(`[Godot stdout] ${line}`);
+          const m = listeningRegex.exec(line);
+          if (m) {
+            const actual = parseInt(m[1], 10);
+            if (!Number.isNaN(actual) && actual !== this.interactionPort) {
+              console.error(`[SERVER] Game bound port ${actual}, updating from ${this.interactionPort}`);
+              this.interactionPort = actual;
+            }
+          }
         });
       });
 
@@ -3693,7 +3784,7 @@ class GodotServer {
         content: [
           {
             type: 'text',
-            text: `Godot project started in debug mode. Use get_debug_output to see output. Game interaction server connecting on port ${this.INTERACTION_PORT}...`,
+            text: `Godot project started in debug mode. Use get_debug_output to see output. Game interaction server connecting on port ${this.interactionPort}...`,
           },
         ],
       };
