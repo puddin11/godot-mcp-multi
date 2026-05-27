@@ -40,6 +40,27 @@ const GODOT_DEBUG_MODE: boolean = true; // Always use GODOT DEBUG MODE
 
 const execFileAsync = promisify(execFile);
 
+// Named tool-filter profiles. Each maps a profile name to a list of canonical
+// tool names to disable. Used in conjunction with GODOT_MCP_PROFILE env var.
+// Per-slot agents can opt into a profile to shrink the deferred-tool pool to
+// only what the target game actually uses. Unlisted tools are always exposed.
+const PROFILES: Record<string, string[]> = {
+  // Spirits: Unbound — 2D-UI + 3D-board card game. No GPUParticles,
+  // NavigationAgent, TileMap, Skeleton, CSG, Light3D, Video, etc.
+  'spirits-deckbuilder': [
+    'game_physics_3d', 'game_navigation_3d', 'game_navigate_path',
+    'game_csg', 'game_gridmap', 'game_terrain', 'game_skeleton_ik', 'game_bone_pose',
+    'game_visual_shader', 'game_multimesh', 'game_light_3d', 'game_audio_spatial',
+    'game_3d_effects', 'game_path_3d', 'game_sky', 'game_gi',
+    'game_camera_attributes', 'game_procedural_mesh', 'game_mesh_instance',
+    'game_render_settings', 'game_world_settings', 'game_video',
+    'game_set_particles', 'game_tilemap', 'game_parallax',
+    'export_mesh_library', 'export_project', 'manage_export_presets',
+    'manage_docker_export', 'manage_ci_pipeline', 'create_project',
+    'manage_translations', 'game_locale',
+  ],
+};
+
 // Derive __filename and __dirname in ESM
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -824,12 +845,44 @@ class GodotServer {
   }
 
   /**
+   * Resolve the set of tool names to hide for this slot. Reads two env vars:
+   *   GODOT_MCP_PROFILE         — name of a preset in PROFILES.
+   *   GODOT_MCP_DISABLED_TOOLS  — comma-separated extra tool names.
+   * Merged as a union. Memoized after first call. Unset → empty set (no filter).
+   */
+  private _disabledToolsCache: Set<string> | null = null;
+  private getDisabledTools(): Set<string> {
+    if (this._disabledToolsCache !== null) {
+      return this._disabledToolsCache;
+    }
+    const disabled = new Set<string>();
+    const profileName = process.env.GODOT_MCP_PROFILE;
+    if (profileName) {
+      const profile = PROFILES[profileName];
+      if (profile) {
+        for (const name of profile) disabled.add(name);
+        console.error(`[SERVER] GODOT_MCP_PROFILE=${profileName} (${profile.length} tools disabled)`);
+      } else {
+        console.error(`[SERVER] GODOT_MCP_PROFILE='${profileName}' is not a known profile, ignoring`);
+      }
+    }
+    const extra = process.env.GODOT_MCP_DISABLED_TOOLS;
+    if (extra) {
+      for (const raw of extra.split(',')) {
+        const name = raw.trim();
+        if (name) disabled.add(name);
+      }
+    }
+    this._disabledToolsCache = disabled;
+    return disabled;
+  }
+
+  /**
    * Set up the tool handlers for the MCP server
    */
   private setupToolHandlers() {
     // Define available tools
-    this.server.setRequestHandler(ListToolsRequestSchema, async () => ({
-      tools: [
+    const ALL_TOOLS = [
         {
           name: 'launch_editor',
           description: 'Launch Godot editor for a specific project',
@@ -3247,12 +3300,73 @@ class GodotServer {
             required: ['projectPath', 'action'],
           },
         },
-      ],
-    }));
+        {
+          name: 'spirits_state_probe',
+          description: 'Spirits: Unbound — per-iter probe. Returns scene path, suspend flag, paused, time_scale, fps, uptime, network mode, board state, round index, board seed, applied seeds, and log-derived counters (asserts / [REPRO] / WATCHDOG) in one round-trip. Cheap enough to call every iter of the overnight bug-finder loop.',
+          inputSchema: {
+            type: 'object',
+            properties: {},
+            required: [],
+          },
+        },
+        {
+          name: 'spirits_suspend_snapshot',
+          description: 'Spirits: Unbound — structured game state at a soft-assert suspend. Returns suspend msg, class tag, elapsed seconds, current CLI seeds, board summary, per-player summary (main/reserves/hand/deck/discard), last [REPRO] seeds, and a tail of the last STATE DIFF. Safe to call when not suspended (returns is_suspended:false).',
+          inputSchema: {
+            type: 'object',
+            properties: {},
+            required: [],
+          },
+        },
+        {
+          name: 'spirits_boot_match',
+          description: 'Spirits: Unbound — set seeds + mode + time_scale + scene change in one call. Replaces the multi-step boot dance (eval seeds + scene-change + game_time_scale). Returns immediately after queueing the deferred scene change — sleep ~5s before probing the new scene.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              boardSeed: { type: 'integer', description: 'Board RNG seed. -1 = random (default).' },
+              ai0Seed: { type: 'integer', description: 'AI player 0 seed. -1 = random (default).' },
+              ai1Seed: { type: 'integer', description: 'AI player 1 seed. -1 = random (default).' },
+              mode: { type: 'string', description: 'Network mode: LOCAL, SERVER, CLIENT, AI_VS_AI. Empty string keeps current mode (default).' },
+              timeScale: { type: 'number', description: 'Engine.time_scale. 1.0 = realtime (default). Use 16.0 for overnight cadence.' },
+              scene: { type: 'string', description: 'Scene path to change to. Default: res://scenes/GameBoard3D.tscn' },
+            },
+            required: [],
+          },
+        },
+        {
+          name: 'spirits_inspect_card',
+          description: 'Spirits: Unbound — drill into one card. Two mutually-exclusive lookup modes: runtimeId scans live board (main/reserves/hand/deck/discard for both players) and walks base_ref chains; cardId is a template lookup from cardDB_Global. Returns base AND effective stats so modifier impact is visible.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              runtimeId: { type: 'integer', description: 'Runtime card ID to look up in the live board. Use this OR cardId, not both.' },
+              cardId: { type: 'string', description: 'Card template ID (e.g. "fire_imp"). Returns base stats from cardDB_Global. Use this OR runtimeId, not both.' },
+            },
+            required: [],
+          },
+        },
+      ];
+
+    this.server.setRequestHandler(ListToolsRequestSchema, async () => {
+      const disabled = this.getDisabledTools();
+      return {
+        tools: disabled.size === 0
+          ? ALL_TOOLS
+          : ALL_TOOLS.filter(t => !disabled.has(t.name)),
+      };
+    });
 
     // Handle tool calls
     this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
       this.logDebug(`Handling tool request: ${request.params.name}`);
+      const disabled = this.getDisabledTools();
+      if (disabled.has(request.params.name)) {
+        throw new McpError(
+          ErrorCode.MethodNotFound,
+          `Tool '${request.params.name}' is disabled by GODOT_MCP_PROFILE / GODOT_MCP_DISABLED_TOOLS`,
+        );
+      }
       switch (request.params.name) {
         case 'launch_editor':
           return await this.handleLaunchEditor(request.params.arguments);
@@ -3294,6 +3408,15 @@ class GodotServer {
           return await this.handleGameGetUi();
         case 'game_get_scene_tree':
           return await this.handleGameGetSceneTree();
+        // Spirits: Unbound — game-domain helpers
+        case 'spirits_state_probe':
+          return await this.handleSpiritsStateProbe();
+        case 'spirits_suspend_snapshot':
+          return await this.handleSpiritsSuspendSnapshot();
+        case 'spirits_boot_match':
+          return await this.handleSpiritsBootMatch(request.params.arguments);
+        case 'spirits_inspect_card':
+          return await this.handleSpiritsInspectCard(request.params.arguments);
         // New runtime interaction tools
         case 'game_eval':
           return await this.handleGameEval(request.params.arguments);
@@ -4610,6 +4733,41 @@ class GodotServer {
     args = normalizeParameters(args || {});
     if (!args.code) return createErrorResponse('code parameter is required.');
     return this.gameCommand('eval', args, a => ({ code: a.code }), 30000);
+  }
+
+  // ---- Spirits: Unbound — game-domain helpers ----
+  // Dispatched server-side in C:/GodotGames/deckbuilder/scripts/mcp_interaction_server.gd
+  // (commands: spirits_state_probe / spirits_suspend_snapshot / spirits_boot_match /
+  // spirits_inspect_card), implemented in scripts/spirits_mcp_helpers.gd. These are
+  // first-class MCP tools rather than game_eval wrappers so agents get autocomplete
+  // and schema validation; they no-op cleanly when no game is running.
+
+  private async handleSpiritsStateProbe() {
+    return this.gameCommand('spirits_state_probe', {}, () => ({}));
+  }
+
+  private async handleSpiritsSuspendSnapshot() {
+    return this.gameCommand('spirits_suspend_snapshot', {}, () => ({}));
+  }
+
+  private async handleSpiritsBootMatch(args: any) {
+    return this.gameCommand('spirits_boot_match', args, a => ({
+      board_seed: a.boardSeed ?? -1,
+      ai0_seed: a.ai0Seed ?? -1,
+      ai1_seed: a.ai1Seed ?? -1,
+      mode: a.mode ?? '',
+      time_scale: a.timeScale ?? 1.0,
+      scene: a.scene ?? 'res://scenes/GameBoard3D.tscn',
+    }), 30000);
+  }
+
+  private async handleSpiritsInspectCard(args: any) {
+    return this.gameCommand('spirits_inspect_card', args, a => {
+      const out: Record<string, any> = {};
+      if (a.runtimeId !== undefined) out.runtime_id = a.runtimeId;
+      if (a.cardId !== undefined) out.card_id = a.cardId;
+      return out;
+    });
   }
 
   private async handleGameGetProperty(args: any) {
