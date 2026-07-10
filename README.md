@@ -163,6 +163,7 @@ The original godot-mcp provided 20 tools for basic project management and scene 
 - **`rename_file`** - Rename or move a file within the project
 - **`manage_resource`** - Read or modify .tres/.res resource files
 - **`create_script`** - Create a GDScript file from a template
+- **`validate_script`** - Check a GDScript file for syntax/type errors headlessly (no run needed)
 - **`manage_scene_signals`** - List/add/remove signal connections in .tscn files
 - **`manage_layers`** - List/set named layer definitions in project
 - **`manage_plugins`** - List/enable/disable editor plugins
@@ -415,12 +416,13 @@ The original godot-mcp provided 20 tools for basic project management and scene 
 | `game_audio_bus_layout` | Create/remove/reorder audio buses and routing |
 | `game_audio_spatial` | Configure AudioStreamPlayer3D spatial properties |
 
-### Editor & Project Tools (12 tools)
+### Editor & Project Tools (13 tools)
 | Tool | Description |
 |------|-------------|
 | `rename_file` | Rename or move a file within the project |
 | `manage_resource` | Read or modify .tres/.res resource files |
 | `create_script` | Create a GDScript file from a template |
+| `validate_script` | Check a GDScript file for syntax/type errors (headless) |
 | `manage_scene_signals` | List/add/remove signal connections in .tscn files |
 | `manage_layers` | List/set named layer definitions in project |
 | `manage_plugins` | List/enable/disable editor plugins |
@@ -553,13 +555,14 @@ The server uses two communication channels:
 
 ## Testing
 
-The project uses [Vitest](https://vitest.dev/) with 390 tests across 3 files:
+The project uses [Vitest](https://vitest.dev/) with 453 tests across 4 files:
 
 | File | Tests | What it covers |
 |------|-------|----------------|
 | `tests/utils.test.ts` | 31 | Parameter mappings, normalization, path validation, error responses, version detection |
-| `tests/tool-definitions.test.ts` | 157 | All 149 tools defined, schemas valid, names unique, descriptions < 80 chars |
-| `tests/handlers.test.ts` | 202 | Game command arg transforms, required-param validation, headless op path checks, source structure |
+| `tests/tool-definitions.test.ts` | 171 | All tools defined, schemas valid, names unique, descriptions < 80 chars |
+| `tests/handlers.test.ts` | 243 | Game command arg transforms, required-param validation, headless op path checks, source structure |
+| `tests/validate-script.test.ts` | 8 | GDScript diagnostic parsing (parse/type errors, line numbers) |
 
 ```bash
 npm test          # run once
