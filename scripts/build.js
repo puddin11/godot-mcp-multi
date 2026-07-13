@@ -26,6 +26,12 @@ try {
     path.join(__dirname, '..', 'build', 'scripts', 'mcp_interaction_server.gd')
   );
 
+  // Copy the validate_script.gd file
+  fs.copyFileSync(
+    path.join(__dirname, '..', 'src', 'scripts', 'validate_script.gd'),
+    path.join(__dirname, '..', 'build', 'scripts', 'validate_script.gd')
+  );
+
   console.log('Successfully copied scripts to build/scripts');
 } catch (error) {
   console.error('Error copying scripts:', error);

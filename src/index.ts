@@ -116,6 +116,7 @@ class GodotServer {
   private godotPath: string | null = null;
   private operationsScriptPath: string;
   private interactionScriptPath: string;
+  private validateScriptPath: string;
   private validatedPaths: Map<string, boolean> = new Map();
   private strictPathValidation: boolean = false;
   private gameConnection: GameConnection = {
@@ -196,6 +197,7 @@ class GodotServer {
     // Set the path to the operations script
     this.operationsScriptPath = join(__dirname, 'scripts', 'godot_operations.gd');
     this.interactionScriptPath = join(__dirname, 'scripts', 'mcp_interaction_server.gd');
+    this.validateScriptPath = join(__dirname, 'scripts', 'validate_script.gd');
     if (debugMode) console.error(`[DEBUG] Operations script path: ${this.operationsScriptPath}`);
 
     // Initialize the MCP server
@@ -5771,10 +5773,43 @@ class GodotServer {
         if (!args.actionName)
           return createErrorResponse('actionName is required for add action.');
         const deadzone = args.deadzone !== undefined ? args.deadzone : 0.5;
-        let events = '';
+        const escapedName = args.actionName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        let newEventObj = '';
+        let scancode = 0;
         if (args.key) {
-          events = `, "events": [Object(InputEventKey,"resource_local_to_scene":false,"resource_name":"","device":-1,"window_id":0,"alt_pressed":false,"shift_pressed":false,"ctrl_pressed":false,"meta_pressed":false,"pressed":false,"keycode":0,"physical_keycode":${this.keyNameToScancode(args.key)},"key_label":0,"unicode":0,"location":0,"echo":false,"script":null)]`;
+          scancode = this.keyNameToScancode(args.key);
+          newEventObj = `Object(InputEventKey,"resource_local_to_scene":false,"resource_name":"","device":-1,"window_id":0,"alt_pressed":false,"shift_pressed":false,"ctrl_pressed":false,"meta_pressed":false,"pressed":false,"keycode":0,"physical_keycode":${scancode},"key_label":0,"unicode":0,"location":0,"echo":false,"script":null)`;
         }
+
+        // Look for an existing top-level entry for this action so we can merge
+        // the new event into it instead of appending a duplicate `actionname=` line.
+        const existingActionPattern = new RegExp(`^${escapedName}\\s*=\\s*\\{[\\s\\S]*?\\}\\s*$`, 'm');
+        const existingMatch = content.match(existingActionPattern);
+
+        if (existingMatch) {
+          const block = existingMatch[0];
+          const deadzoneMatch = block.match(/"deadzone"\s*:\s*([\d.eE+-]+)/);
+          const existingDeadzone = deadzoneMatch ? deadzoneMatch[1] : String(deadzone);
+          const eventsMatch = block.match(/"events"\s*:\s*\[([\s\S]*)\]\s*\}\s*$/);
+          const existingEvents = eventsMatch ? eventsMatch[1] : '';
+          let mergedEvents = existingEvents;
+          if (newEventObj) {
+            const dupPattern = new RegExp(`"physical_keycode"\\s*:\\s*${scancode}\\b`);
+            if (!dupPattern.test(existingEvents)) {
+              mergedEvents = existingEvents.trim().length > 0
+                ? `${existingEvents}, ${newEventObj}`
+                : newEventObj;
+            }
+          }
+          const newBlock = mergedEvents.trim().length > 0
+            ? `${args.actionName}={"deadzone": ${existingDeadzone}, "events": [${mergedEvents}]}`
+            : `${args.actionName}={"deadzone": ${existingDeadzone}}`;
+          content = content.replace(existingActionPattern, newBlock);
+          writeFileSync(projectFile, content, 'utf8');
+          return { content: [{ type: 'text', text: `Input action "${args.actionName}" updated (event merged into existing action).` }] };
+        }
+
+        const events = newEventObj ? `, "events": [${newEventObj}]` : '';
         const inputLine = `${args.actionName}={"deadzone": ${deadzone}${events}}`;
         if (content.includes('[input]')) {
           content = content.replace('[input]', `[input]\n\n${inputLine}`);
@@ -6699,10 +6734,21 @@ class GodotServer {
   ): Promise<{ completed: boolean; errors: ReturnType<typeof parseGodotScriptDiagnostics>; error?: string }> {
     let output = '';
     let failed = false;
+    // res:// path of the target script, relative to the project root.
+    const scriptRes = `res://${relative(projectPath, scriptFull).replace(/\\/g, '/')}`;
     try {
+      // NOTE: this deliberately does NOT use `--check-only --script <path>`.
+      // That mode parses/compiles the script from Object._init(), which runs
+      // before Main::start() registers project autoload singletons, so only
+      // one autoload (whichever the engine happens to resolve first) is ever
+      // visible — every other autoload reference is misreported as
+      // "Identifier not found". validate_script.gd instead loads the target
+      // script from SceneTree._initialize(), which runs after autoloads are
+      // live, so all of them resolve correctly while genuine compile errors
+      // are still reported the same way.
       const { stdout, stderr } = await execFileAsync(
         this.godotPath!,
-        ['--headless', '--path', projectPath, '--check-only', '--script', scriptFull],
+        ['--headless', '--path', projectPath, '--script', this.validateScriptPath, scriptRes],
         { timeout: 30000, maxBuffer: 16 * 1024 * 1024 }
       );
       output = `${stdout ?? ''}${stderr ?? ''}`;
