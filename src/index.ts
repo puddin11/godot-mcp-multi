@@ -404,18 +404,20 @@ class GodotServer {
     const projectFile = join(projectPath, 'project.godot');
     const destScript = join(projectPath, 'mcp_interaction_server.gd');
 
-    // Copy the interaction script into the project
-    copyFileSync(this.interactionScriptPath, destScript);
-    this.logDebug(`Copied interaction server script to ${destScript}`);
-
-    // Add autoload entry to project.godot
+    // Check whether the autoload is already registered BEFORE touching the
+    // project. A project that ships its own McpInteractionServer autoload
+    // (pointing at its own script/uid) must not get a stale bundled copy
+    // dropped at its root — so the early-return has to happen first.
     let content = readFileSync(projectFile, 'utf8');
 
-    // Check if already injected
     if (content.includes(this.AUTOLOAD_NAME)) {
       this.logDebug('Interaction server autoload already present');
       return;
     }
+
+    // Copy the interaction script into the project
+    copyFileSync(this.interactionScriptPath, destScript);
+    this.logDebug(`Copied interaction server script to ${destScript}`);
 
     const autoloadLine = `${this.AUTOLOAD_NAME}="*res://mcp_interaction_server.gd"`;
 
@@ -440,12 +442,17 @@ class GodotServer {
 
     // Remove autoload line from project.godot
     if (existsSync(projectFile)) {
-      let content = readFileSync(projectFile, 'utf8');
+      const content = readFileSync(projectFile, 'utf8');
       // Remove the autoload line (and any surrounding blank line)
       const autoloadLine = `${this.AUTOLOAD_NAME}="*res://mcp_interaction_server.gd"`;
-      content = content.replace(new RegExp(`\\n?${autoloadLine.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\n?`), '\n');
-      writeFileSync(projectFile, content, 'utf8');
-      this.logDebug('Removed interaction server autoload from project.godot');
+      const stripped = content.replace(new RegExp(`\\n?${autoloadLine.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\n?`), '\n');
+      // Only write when the regex actually removed our line. Writing
+      // unconditionally bumps project.godot's mtime on every stop, which
+      // churns projects that never had the line injected in the first place.
+      if (stripped !== content) {
+        writeFileSync(projectFile, stripped, 'utf8');
+        this.logDebug('Removed interaction server autoload from project.godot');
+      }
     }
 
     // Delete the script file
@@ -3335,7 +3342,7 @@ class GodotServer {
         },
         {
           name: 'spirits_state_probe',
-          description: 'Spirits: Unbound — per-iter probe. Returns scene path, suspend flag, paused, time_scale, fps, uptime, network mode, board state, round index, board seed, applied seeds, and log-derived counters (asserts / [REPRO] / WATCHDOG) in one round-trip. Cheap enough to call every iter of the overnight bug-finder loop.',
+          description: 'Spirits: Unbound — one-call health probe: scene, suspend, seeds, log counters.',
           inputSchema: {
             type: 'object',
             properties: {},
@@ -3344,7 +3351,7 @@ class GodotServer {
         },
         {
           name: 'spirits_suspend_snapshot',
-          description: 'Spirits: Unbound — structured game state at a soft-assert suspend. Returns suspend msg, class tag, elapsed seconds, current CLI seeds, board summary, per-player summary (main/reserves/hand/deck/discard), last [REPRO] seeds, and a tail of the last STATE DIFF. Safe to call when not suspended (returns is_suspended:false).',
+          description: 'Spirits: Unbound — structured state snapshot at a soft-assert suspend.',
           inputSchema: {
             type: 'object',
             properties: {},
@@ -3353,14 +3360,14 @@ class GodotServer {
         },
         {
           name: 'spirits_boot_match',
-          description: 'Spirits: Unbound — set seeds + mode + time_scale + scene change in one call. Replaces the multi-step boot dance (eval seeds + scene-change + game_time_scale). Returns immediately after queueing the deferred scene change — sleep ~5s before probing the new scene.',
+          description: 'Spirits: Unbound — seeds + mode + time_scale + scene change in one call.',
           inputSchema: {
             type: 'object',
             properties: {
               boardSeed: { type: 'integer', description: 'Board RNG seed. -1 = random (default).' },
               ai0Seed: { type: 'integer', description: 'AI player 0 seed. -1 = random (default).' },
               ai1Seed: { type: 'integer', description: 'AI player 1 seed. -1 = random (default).' },
-              mode: { type: 'string', description: 'Network mode: LOCAL, SERVER, CLIENT, AI_VS_AI. Empty string keeps current mode (default).' },
+              mode: { type: 'string', description: 'LOCAL, SERVER, CLIENT, or AI_VS_AI. Empty keeps current mode (default).' },
               timeScale: { type: 'number', description: 'Engine.time_scale. 1.0 = realtime (default). Use 16.0 for overnight cadence.' },
               scene: { type: 'string', description: 'Scene path to change to. Default: res://scenes/GameBoard3D.tscn' },
             },
@@ -3369,12 +3376,12 @@ class GodotServer {
         },
         {
           name: 'spirits_inspect_card',
-          description: 'Spirits: Unbound — drill into one card. Two mutually-exclusive lookup modes: runtimeId scans live board (main/reserves/hand/deck/discard for both players) and walks base_ref chains; cardId is a template lookup from cardDB_Global. Returns base AND effective stats so modifier impact is visible.',
+          description: 'Spirits: Unbound — card detail by live runtimeId or template cardId.',
           inputSchema: {
             type: 'object',
             properties: {
               runtimeId: { type: 'integer', description: 'Runtime card ID to look up in the live board. Use this OR cardId, not both.' },
-              cardId: { type: 'string', description: 'Card template ID (e.g. "fire_imp"). Returns base stats from cardDB_Global. Use this OR runtimeId, not both.' },
+              cardId: { type: 'string', description: 'Template id (e.g. fire_imp) — base stats from cardDB. Not with runtimeId.' },
             },
             required: [],
           },
@@ -4114,7 +4121,10 @@ class GodotServer {
    * Handle the stop_project tool
    */
   private async handleStopProject() {
-    if (!this.activeProcess) {
+    // Snapshot the record up front: the child's own 'exit' handler nulls
+    // this.activeProcess, and it can fire while we await below.
+    const ap = this.activeProcess;
+    if (!ap) {
       return createErrorResponse(
         'No active Godot process to stop.'
       );
@@ -4122,10 +4132,41 @@ class GodotServer {
 
     this.logDebug('Stopping active Godot process');
     this.disconnectFromGame();
-    this.activeProcess.process.kill();
-    const output = this.activeProcess.output;
-    const errors = this.activeProcess.errors;
-    this.activeProcess = null;
+
+    // Register the exit listener BEFORE kill() — a process that dies
+    // immediately would otherwise emit 'exit' before we are listening.
+    const STOP_EXIT_TIMEOUT_MS = 2000;
+    const exitPromise = new Promise<boolean>(resolve => {
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        resolve(false);
+      }, STOP_EXIT_TIMEOUT_MS);
+      ap.process.once('exit', () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(true);
+      });
+    });
+
+    ap.process.kill();
+
+    // Give the process a brief window to actually die so the caller knows
+    // whether it is really gone. No SIGKILL escalation, no waiting past 2s.
+    const exitConfirmed = await exitPromise;
+    if (!exitConfirmed) {
+      this.logDebug('Godot process did not exit within 2s of SIGTERM');
+    }
+
+    const output = ap.output;
+    const errors = ap.errors;
+    const droppedOutputLines = ap.droppedOutput;
+    const droppedErrorLines = ap.droppedErrors;
+    if (this.activeProcess === ap) {
+      this.activeProcess = null;
+    }
     this.lastErrorIndex = 0;
     this.lastLogIndex = 0;
 
@@ -4147,8 +4188,11 @@ class GodotServer {
           text: JSON.stringify(
             {
               message: 'Godot project stopped',
+              exitConfirmed,
               totalOutputLines: output.length,
               totalErrorLines: errors.length,
+              droppedOutputLines,
+              droppedErrorLines,
               finalOutput: output.slice(-STOP_TAIL),
               finalErrors: errors.slice(-STOP_TAIL),
             },
