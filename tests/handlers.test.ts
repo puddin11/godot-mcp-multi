@@ -1058,6 +1058,28 @@ describe('Lifecycle handlers', () => {
     expect(sourceCode).toContain('spawn(');
   });
 
+  it('run_project accepts extraArgs pass-through argv', () => {
+    expect(sourceCode).toContain('extraArgs');
+    expect(sourceCode).toContain('Array.isArray(args.extraArgs)');
+  });
+
+  it('run_project auto-profiles AI_VS_AI runs behind an env gate', () => {
+    expect(sourceCode).toContain('GODOT_MCP_AUTO_PROFILE');
+    expect(sourceCode).toContain("cmdArgs.includes('--ai_vs_ai')");
+    expect(sourceCode).toContain('--profile=mcp_');
+  });
+
+  it('run_project supports waitForReady with a cheap probe round-trip', () => {
+    expect(sourceCode).toContain('waitForReady');
+    expect(sourceCode).toContain("args.waitForReady === true");
+    expect(sourceCode).toContain("this.sendGameCommand('get_performance', {}, 8000)");
+    expect(sourceCode).toContain('probeOk');
+  });
+
+  it('connectToGame reports success as a boolean', () => {
+    expect(sourceCode).toContain('private async connectToGame(projectPath: string): Promise<boolean>');
+  });
+
   it('handleStopProject exists and kills process', () => {
     expect(sourceCode).toContain('handleStopProject');
     // Should have some form of process termination

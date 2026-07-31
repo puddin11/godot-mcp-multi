@@ -470,9 +470,11 @@ class GodotServer {
   }
 
   /**
-   * Connect to the game's TCP interaction server with retries
+   * Connect to the game's TCP interaction server with retries.
+   * Resolves true once the socket is up, false if the process died first or
+   * every attempt failed — callers (waitForReady) must be able to tell.
    */
-  private async connectToGame(projectPath: string): Promise<void> {
+  private async connectToGame(projectPath: string): Promise<boolean> {
     this.gameConnection.projectPath = projectPath;
 
     // Initial delay to let the game start up
@@ -484,7 +486,7 @@ class GodotServer {
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       if (!this.activeProcess) {
         this.logDebug('Game process no longer running, aborting connection');
-        return;
+        return false;
       }
 
       try {
@@ -539,7 +541,7 @@ class GodotServer {
         });
 
         // Successfully connected
-        return;
+        return true;
       } catch (err) {
         this.logDebug(`Connection attempt ${attempt}/${maxAttempts} failed, retrying in ${retryDelay}ms...`);
         await new Promise(resolve => setTimeout(resolve, retryDelay));
@@ -547,6 +549,7 @@ class GodotServer {
     }
 
     console.error(`[SERVER] Failed to connect to game interaction server after ${maxAttempts} attempts`);
+    return false;
   }
 
   /**
@@ -927,6 +930,15 @@ class GodotServer {
               scene: {
                 type: 'string',
                 description: 'Optional: Specific scene to run',
+              },
+              extraArgs: {
+                type: 'array',
+                items: { type: 'string' },
+                description: 'Extra argv appended to the Godot command line (e.g. --headless).',
+              },
+              waitForReady: {
+                type: 'boolean',
+                description: 'Wait for the game TCP link plus one probe round-trip before returning.',
               },
             },
             required: ['projectPath'],
@@ -3886,6 +3898,25 @@ class GodotServer {
         cmdArgs.push(args.scene);
       }
 
+      // Pass-through argv, so a soak boot (--ai_vs_ai --time_scale=16 ...) is
+      // one call. Non-strings are silently skipped, matching the file's
+      // existing optional-array-parameter style.
+      if (args.extraArgs && Array.isArray(args.extraArgs)) {
+        for (const extra of args.extraArgs) {
+          if (typeof extra === 'string' && extra.length > 0) {
+            cmdArgs.push(extra);
+          }
+        }
+      }
+
+      // Per-slot save/log isolation for soak runs. Gated on env so interactive
+      // slots keep the user's real saves; AI_VS_AI builds its own decks anyway.
+      if (globalThis.process.env.GODOT_MCP_AUTO_PROFILE === '1'
+          && cmdArgs.includes('--ai_vs_ai')
+          && !cmdArgs.some(a => a.startsWith('--profile='))) {
+        cmdArgs.push(`--profile=mcp_${this.interactionPort}`);
+      }
+
       this.logDebug(`Running Godot project: ${args.projectPath} on port ${this.interactionPort}`);
       const process = spawn(this.godotPath!, cmdArgs, { stdio: 'pipe', env: spawnEnv });
 
@@ -3932,10 +3963,45 @@ class GodotServer {
 
       // activeProcess was assigned above (before the data handlers were wired).
 
-      // Start async TCP connection to the interaction server (fire-and-forget)
-      this.connectToGame(args.projectPath).catch(err => {
-        this.logDebug(`Failed to connect to game interaction server: ${err}`);
-      });
+      // Start the async TCP connection to the interaction server. Kept as a
+      // captured promise so waitForReady can join it; otherwise it stays
+      // fire-and-forget exactly as before.
+      const connectPromise = this.connectToGame(args.projectPath)
+        .catch((err) => { this.logDebug(`connectToGame failed: ${err}`); return false; });
+
+      if (args.waitForReady === true) {
+        const connected = await connectPromise;
+        // One cheap read-only round-trip proves the game is actually answering
+        // commands, not merely holding the socket open.
+        let probeOk = false;
+        if (connected) {
+          try {
+            const probe = await this.sendGameCommand('get_performance', {}, 8000);
+            probeOk = !probe?.error;
+          } catch (err) {
+            this.logDebug(`waitForReady probe failed: ${err}`);
+            probeOk = false;
+          }
+        }
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify(
+                {
+                  message: 'Godot project started',
+                  port: this.interactionPort,
+                  connected,
+                  probeOk,
+                  argv: cmdArgs,
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      }
 
       return {
         content: [
