@@ -62,6 +62,10 @@ const ALL_TOOL_NAMES = [
   'game_render_settings', 'game_resource',
   // Batch 6: Visual Shader + Terrain + Video + CI/CD
   'game_visual_shader', 'game_terrain', 'game_video', 'manage_ci_pipeline', 'manage_docker_export',
+  // Fork additions: process introspection + Spirits: Unbound game-domain helpers
+  'game_status', 'clear_debug_output',
+  'spirits_state_probe', 'spirits_suspend_snapshot', 'spirits_boot_match',
+  'spirits_inspect_card', 'spirits_observe', 'spirits_submit_command',
 ];
 
 let sourceCode: string;
@@ -71,8 +75,8 @@ beforeAll(() => {
 });
 
 describe('Tool definitions', () => {
-  it('defines exactly 154 tools', () => {
-    expect(ALL_TOOL_NAMES).toHaveLength(154);
+  it('defines exactly 162 tools', () => {
+    expect(ALL_TOOL_NAMES).toHaveLength(162);
   });
 
   it('all tool names are unique', () => {

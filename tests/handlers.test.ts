@@ -1893,6 +1893,135 @@ describe('Game command handlers — visual shader, terrain, video, CI/CD', () =>
 });
 
 // ---------------------------------------------------------------------------
+// 7b. Spirits: Unbound game-domain helpers
+// ---------------------------------------------------------------------------
+describe('Game command handlers — Spirits: Unbound helpers', () => {
+  // spirits_observe
+  describe('handleSpiritsObserve', () => {
+    const argsFn = (a: any) => ({
+      seat: a.seat ?? 0,
+      include_candidates: a.includeCandidates ?? true,
+      candidate_cap: a.candidateCap ?? 10,
+    });
+
+    it('defaults seat to 0, candidates on, cap 10', () => {
+      const r = fakeGameCommand(true, true, {}, argsFn);
+      expect(r.error).toBeNull();
+      expect(r.commandArgs).toEqual({ seat: 0, include_candidates: true, candidate_cap: 10 });
+    });
+
+    it('passes explicit seat, candidate flag and cap', () => {
+      const r = fakeGameCommand(true, true, { seat: 1, includeCandidates: false, candidateCap: 3 }, argsFn);
+      expect(r.commandArgs).toEqual({ seat: 1, include_candidates: false, candidate_cap: 3 });
+    });
+
+    it('keeps seat 0 rather than defaulting it away', () => {
+      const r = fakeGameCommand(true, true, { seat: 0 }, argsFn);
+      expect(r.commandArgs).toEqual({ seat: 0, include_candidates: true, candidate_cap: 10 });
+    });
+
+    it('returns error when no active process', () => {
+      const r = fakeGameCommand(false, true, { seat: 0 }, argsFn);
+      expect(r.error).toContain('No active Godot process');
+    });
+
+    it('uses a 30s timeout for candidate enumeration', () => {
+      const block = sourceCode.substring(
+        sourceCode.indexOf('private async handleSpiritsObserve('),
+        sourceCode.indexOf('private async handleSpiritsSubmitCommand(')
+      );
+      expect(block).toContain('30000');
+    });
+  });
+
+  // spirits_submit_command
+  describe('handleSpiritsSubmitCommand', () => {
+    const argsFn = (a: any) => {
+      const out: Record<string, any> = { seat: a.seat ?? 0 };
+      if (a.commands !== undefined) out.commands = a.commands;
+      if (a.externalControl !== undefined) out.external_control = a.externalControl;
+      return out;
+    };
+
+    it('sends only seat when nothing else is supplied', () => {
+      const r = fakeGameCommand(true, true, {}, argsFn);
+      expect(r.error).toBeNull();
+      expect(r.commandArgs).toEqual({ seat: 0 });
+    });
+
+    it('omits commands and external_control when absent', () => {
+      const r = fakeGameCommand(true, true, { seat: 1 }, argsFn);
+      expect(r.commandArgs).not.toHaveProperty('commands');
+      expect(r.commandArgs).not.toHaveProperty('external_control');
+    });
+
+    it('passes command dicts through untouched', () => {
+      const commands = [
+        { type: 'PLAY_CARD', card_runtime_ID: 12, play_location: 0, card_ID: 'fire_imp' },
+      ];
+      const r = fakeGameCommand(true, true, { seat: 1, commands }, argsFn);
+      expect(r.commandArgs).toEqual({ seat: 1, commands });
+    });
+
+    it('includes external_control when explicitly false', () => {
+      const r = fakeGameCommand(true, true, { seat: 0, externalControl: false }, argsFn);
+      expect(r.commandArgs).toEqual({ seat: 0, external_control: false });
+    });
+
+    it('includes external_control when explicitly true', () => {
+      const r = fakeGameCommand(true, true, { seat: 1, externalControl: true }, argsFn);
+      expect(r.commandArgs).toEqual({ seat: 1, external_control: true });
+    });
+
+    it('returns error when not connected', () => {
+      const r = fakeGameCommand(true, false, { seat: 0 }, argsFn);
+      expect(r.error).toContain('Not connected');
+    });
+  });
+
+  // spirits_boot_match — chaos injection parameter
+  describe('handleSpiritsBootMatch', () => {
+    const argsFn = (a: any) => ({
+      board_seed: a.boardSeed ?? -1,
+      ai0_seed: a.ai0Seed ?? -1,
+      ai1_seed: a.ai1Seed ?? -1,
+      mode: a.mode ?? '',
+      time_scale: a.timeScale ?? 1.0,
+      scene: a.scene ?? 'res://scenes/GameBoard3D.tscn',
+      inject_disconnect_probability: a.injectDisconnectProbability ?? -1,
+    });
+
+    it('defaults inject_disconnect_probability to -1 (keep current)', () => {
+      const r = fakeGameCommand(true, true, {}, argsFn);
+      expect(r.error).toBeNull();
+      expect(r.commandArgs).toEqual({
+        board_seed: -1,
+        ai0_seed: -1,
+        ai1_seed: -1,
+        mode: '',
+        time_scale: 1.0,
+        scene: 'res://scenes/GameBoard3D.tscn',
+        inject_disconnect_probability: -1,
+      });
+    });
+
+    it('passes an explicit disconnect probability', () => {
+      const r = fakeGameCommand(true, true, { mode: 'AI_VS_AI', timeScale: 16.0, injectDisconnectProbability: 0.25 }, argsFn);
+      expect(r.commandArgs).toMatchObject({
+        mode: 'AI_VS_AI',
+        time_scale: 16.0,
+        inject_disconnect_probability: 0.25,
+      });
+    });
+
+    it('passes 0 to disable injection rather than defaulting to -1', () => {
+      const r = fakeGameCommand(true, true, { injectDisconnectProbability: 0 }, argsFn);
+      expect(r.commandArgs?.inject_disconnect_probability).toBe(0);
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
 // 8. createErrorResponse in handlers
 // ---------------------------------------------------------------------------
 describe('Error response format in handlers', () => {
@@ -1955,7 +2084,7 @@ describe('Tool dispatch switch statement', () => {
     const caseRegex = /case '(\w+)':\s*\n\s*return await this\.handle/g;
     const matches = [...sourceCode.matchAll(caseRegex)];
     // Should match all dispatched tools (bump when adding/removing a case).
-    expect(matches.length).toBe(160);
+    expect(matches.length).toBe(162);
   });
 
   it('no case falls through without return', () => {

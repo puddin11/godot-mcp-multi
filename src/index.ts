@@ -3382,6 +3382,7 @@ class GodotServer {
               mode: { type: 'string', description: 'LOCAL, SERVER, CLIENT, or AI_VS_AI. Empty keeps current mode (default).' },
               timeScale: { type: 'number', description: 'Engine.time_scale. 1.0 = realtime (default). Use 16.0 for overnight cadence.' },
               scene: { type: 'string', description: 'Scene path to change to. Default: res://scenes/GameBoard3D.tscn' },
+              injectDisconnectProbability: { type: 'number', description: 'Chaos: fraction of matches disconnect-injected (0..1). -1 keeps.' },
             },
             required: [],
           },
@@ -3396,6 +3397,32 @@ class GodotServer {
               cardId: { type: 'string', description: 'Template id (e.g. fire_imp) — base stats from cardDB. Not with runtimeId.' },
             },
             required: [],
+          },
+        },
+        {
+          name: 'spirits_observe',
+          description: 'Spirits: Unbound — seat view: hand, playability, candidates, board state.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              seat: { type: 'integer', description: 'Player seat: 0 or 1.' },
+              includeCandidates: { type: 'boolean', description: 'Include AI-enumerated candidate plans (default true).' },
+              candidateCap: { type: 'integer', description: 'Max candidate plans returned (default 10).' },
+            },
+            required: ['seat'],
+          },
+        },
+        {
+          name: 'spirits_submit_command',
+          description: 'Spirits: Unbound — queue commands for a seat via the client dispatch path.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              seat: { type: 'integer', description: 'Player seat: 0 or 1.' },
+              commands: { type: 'array', items: { type: 'object' }, description: 'Command dicts: type, card_runtime_ID, play_location, card_ID.' },
+              externalControl: { type: 'boolean', description: 'Set or clear AI-seat takeover. Omit to leave unchanged.' },
+            },
+            required: ['seat'],
           },
         },
       ];
@@ -3473,6 +3500,10 @@ class GodotServer {
           return await this.handleSpiritsBootMatch(request.params.arguments);
         case 'spirits_inspect_card':
           return await this.handleSpiritsInspectCard(request.params.arguments);
+        case 'spirits_observe':
+          return await this.handleSpiritsObserve(request.params.arguments);
+        case 'spirits_submit_command':
+          return await this.handleSpiritsSubmitCommand(request.params.arguments);
         // New runtime interaction tools
         case 'game_eval':
           return await this.handleGameEval(request.params.arguments);
@@ -5019,7 +5050,8 @@ class GodotServer {
   // ---- Spirits: Unbound — game-domain helpers ----
   // Dispatched server-side in C:/GodotGames/deckbuilder/scripts/mcp_interaction_server.gd
   // (commands: spirits_state_probe / spirits_suspend_snapshot / spirits_boot_match /
-  // spirits_inspect_card), implemented in scripts/spirits_mcp_helpers.gd. These are
+  // spirits_inspect_card / spirits_observe / spirits_submit_command), implemented
+  // in scripts/spirits_mcp_helpers.gd. These are
   // first-class MCP tools rather than game_eval wrappers so agents get autocomplete
   // and schema validation; they no-op cleanly when no game is running.
 
@@ -5039,6 +5071,7 @@ class GodotServer {
       mode: a.mode ?? '',
       time_scale: a.timeScale ?? 1.0,
       scene: a.scene ?? 'res://scenes/GameBoard3D.tscn',
+      inject_disconnect_probability: a.injectDisconnectProbability ?? -1,
     }), 30000);
   }
 
@@ -5047,6 +5080,23 @@ class GodotServer {
       const out: Record<string, any> = {};
       if (a.runtimeId !== undefined) out.runtime_id = a.runtimeId;
       if (a.cardId !== undefined) out.card_id = a.cardId;
+      return out;
+    });
+  }
+
+  private async handleSpiritsObserve(args: any) {
+    return this.gameCommand('spirits_observe', args, a => ({
+      seat: a.seat ?? 0,
+      include_candidates: a.includeCandidates ?? true,
+      candidate_cap: a.candidateCap ?? 10,
+    }), 30000);
+  }
+
+  private async handleSpiritsSubmitCommand(args: any) {
+    return this.gameCommand('spirits_submit_command', args, a => {
+      const out: Record<string, any> = { seat: a.seat ?? 0 };
+      if (a.commands !== undefined) out.commands = a.commands;
+      if (a.externalControl !== undefined) out.external_control = a.externalControl;
       return out;
     });
   }
