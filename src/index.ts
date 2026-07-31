@@ -72,7 +72,17 @@ interface GodotProcess {
   process: any;
   output: string[];
   errors: string[];
+  droppedOutput: number; // lines evicted from the front of output[] (ring-buffer overflow)
+  droppedErrors: number; // lines evicted from the front of errors[]
+  gamesStarted: number; // count of [REPRO] markers seen on stdout (each = a fresh game)
+  lastRepro: string | null; // most recent [REPRO] line, for cheap "where are we" checks
+  portResolved: boolean; // once we learn the bound port, stop regex-scanning every stdout line
 }
+
+// Cap each in-memory stdout/stderr ring buffer. At 16x with a noisy game these
+// arrays otherwise grow without bound -> GC pressure starves the TCP round-trip
+// (probe timeouts) and stop_project/get_debug_output serialize tens of MB.
+const MAX_BUFFER_LINES = 4000;
 
 /**
  * Interface for server configuration
@@ -917,7 +927,30 @@ class GodotServer {
         },
         {
           name: 'get_debug_output',
-          description: 'Get the current debug output and errors',
+          description: 'Bounded tail of captured stdout/stderr plus line counts and games-run count.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              tail: {
+                type: 'number',
+                description: 'How many trailing lines of output/errors to return (default 200, max 2000).',
+              },
+            },
+            required: [],
+          },
+        },
+        {
+          name: 'game_status',
+          description: 'Cheap bridge-only status: games run, last [REPRO] seeds, buffer line counts.',
+          inputSchema: {
+            type: 'object',
+            properties: {},
+            required: [],
+          },
+        },
+        {
+          name: 'clear_debug_output',
+          description: 'Drop captured stdout/stderr buffers and reset cursors; keeps games-run count.',
           inputSchema: {
             type: 'object',
             properties: {},
@@ -3373,7 +3406,11 @@ class GodotServer {
         case 'run_project':
           return await this.handleRunProject(request.params.arguments);
         case 'get_debug_output':
-          return await this.handleGetDebugOutput();
+          return await this.handleGetDebugOutput(request.params.arguments);
+        case 'game_status':
+          return await this.handleGameStatus();
+        case 'clear_debug_output':
+          return await this.handleClearDebugOutput();
         case 'stop_project':
           return await this.handleStopProject();
         case 'get_godot_version':
@@ -3844,37 +3881,27 @@ class GodotServer {
 
       this.logDebug(`Running Godot project: ${args.projectPath} on port ${this.interactionPort}`);
       const process = spawn(this.godotPath!, cmdArgs, { stdio: 'pipe', env: spawnEnv });
-      const output: string[] = [];
-      const errors: string[] = [];
 
-      // Recognise the autoload's startup log so we learn the port the game
-      // actually bound (covers races where two godot-mcp processes raced for
-      // the same free port — the autoload auto-scans, so the real port may
-      // differ from what we asked for).
-      const listeningRegex = /McpInteractionServer: Listening on 127\.0\.0\.1:(\d+)/;
+      // Build the tracked-process record up front so the data handlers can
+      // mutate its bounded buffers + counters directly.
+      const ap: GodotProcess = {
+        process,
+        output: [],
+        errors: [],
+        droppedOutput: 0,
+        droppedErrors: 0,
+        gamesStarted: 0,
+        lastRepro: null,
+        portResolved: false,
+      };
+      this.activeProcess = ap;
 
       process.stdout?.on('data', (data: Buffer) => {
-        const lines = data.toString().split('\n');
-        output.push(...lines);
-        lines.forEach((line: string) => {
-          if (line.trim()) this.logDebug(`[Godot stdout] ${line}`);
-          const m = listeningRegex.exec(line);
-          if (m) {
-            const actual = parseInt(m[1], 10);
-            if (!Number.isNaN(actual) && actual !== this.interactionPort) {
-              console.error(`[SERVER] Game bound port ${actual}, updating from ${this.interactionPort}`);
-              this.interactionPort = actual;
-            }
-          }
-        });
+        this.appendOutputLines(ap, data.toString().split('\n'));
       });
 
       process.stderr?.on('data', (data: Buffer) => {
-        const lines = data.toString().split('\n');
-        errors.push(...lines);
-        lines.forEach((line: string) => {
-          if (line.trim()) this.logDebug(`[Godot stderr] ${line}`);
-        });
+        this.appendErrorLines(ap, data.toString().split('\n'));
       });
 
       process.on('exit', (code: number | null) => {
@@ -3896,7 +3923,7 @@ class GodotServer {
         }
       });
 
-      this.activeProcess = { process, output, errors };
+      // activeProcess was assigned above (before the data handlers were wired).
 
       // Start async TCP connection to the interaction server (fire-and-forget)
       this.connectToGame(args.projectPath).catch(err => {
@@ -3920,24 +3947,161 @@ class GodotServer {
   }
 
   /**
-   * Handle the get_debug_output tool
+   * Append stdout lines to the bounded output buffer, tracking the bound port
+   * and the per-game [REPRO] markers as they stream by.
    */
-  private async handleGetDebugOutput() {
+  private appendOutputLines(ap: GodotProcess, lines: string[]): void {
+    const listeningRegex = /McpInteractionServer: Listening on 127\.0\.0\.1:(\d+)/;
+    for (const line of lines) {
+      ap.output.push(line);
+      if (DEBUG_MODE && line.trim()) this.logDebug(`[Godot stdout] ${line}`);
+      if (!ap.portResolved) {
+        const m = listeningRegex.exec(line);
+        if (m) {
+          ap.portResolved = true;
+          const actual = parseInt(m[1], 10);
+          if (!Number.isNaN(actual) && actual !== this.interactionPort) {
+            console.error(`[SERVER] Game bound port ${actual}, updating from ${this.interactionPort}`);
+            this.interactionPort = actual;
+          }
+        }
+      }
+      // Each game prints a "[REPRO] board=.. ai0=.. ai1=.." line at startup.
+      if (line.includes('[REPRO]')) {
+        ap.gamesStarted++;
+        ap.lastRepro = line.trim();
+      }
+    }
+    this.trimBuffer('output');
+  }
+
+  /** Append stderr lines to the bounded error buffer. */
+  private appendErrorLines(ap: GodotProcess, lines: string[]): void {
+    for (const line of lines) {
+      ap.errors.push(line);
+      if (DEBUG_MODE && line.trim()) this.logDebug(`[Godot stderr] ${line}`);
+    }
+    this.trimBuffer('errors');
+  }
+
+  /**
+   * Evict the oldest lines once a buffer exceeds MAX_BUFFER_LINES, and rebase
+   * the consumer cursor (lastLogIndex/lastErrorIndex) so game_get_logs /
+   * game_get_errors still return only genuinely-new lines after a trim.
+   */
+  private trimBuffer(stream: 'output' | 'errors'): void {
+    const ap = this.activeProcess;
+    if (!ap) return;
+    const arr = stream === 'output' ? ap.output : ap.errors;
+    const overflow = arr.length - MAX_BUFFER_LINES;
+    if (overflow <= 0) return;
+    arr.splice(0, overflow);
+    if (stream === 'output') {
+      ap.droppedOutput += overflow;
+      this.lastLogIndex = Math.max(0, this.lastLogIndex - overflow);
+    } else {
+      ap.droppedErrors += overflow;
+      this.lastErrorIndex = Math.max(0, this.lastErrorIndex - overflow);
+    }
+  }
+
+  /**
+   * Handle the get_debug_output tool. Returns a bounded tail plus counts rather
+   * than the full buffers, so a long-running noisy game can't blow the response
+   * size (the buffers themselves are already capped at MAX_BUFFER_LINES).
+   */
+  private async handleGetDebugOutput(args?: any) {
     if (!this.activeProcess) {
       return createErrorResponse(
         'No active Godot process.'
       );
     }
-
+    const ap = this.activeProcess;
+    const tail = Math.max(1, Math.min(2000, Number(args?.tail) || 200));
     return {
       content: [
         {
           type: 'text',
           text: JSON.stringify(
             {
-              output: this.activeProcess.output,
-              errors: this.activeProcess.errors,
+              gamesStarted: ap.gamesStarted,
+              lastRepro: ap.lastRepro,
+              bufferedOutputLines: ap.output.length,
+              bufferedErrorLines: ap.errors.length,
+              droppedOutputLines: ap.droppedOutput,
+              droppedErrorLines: ap.droppedErrors,
+              tail,
+              output: ap.output.slice(-tail),
+              errors: ap.errors.slice(-tail),
             },
+            null,
+            2
+          ),
+        },
+      ],
+    };
+  }
+
+  /**
+   * Handle the game_status tool — a cheap, bridge-only health/progress check
+   * that never round-trips to the running game (so it can't time out even when
+   * the game is busy). Answers "how many games have run / where are we / how
+   * noisy is it" from data the bridge already captured off stdout.
+   */
+  private async handleGameStatus() {
+    if (!this.activeProcess) {
+      return createErrorResponse('No active Godot process. Use run_project first.');
+    }
+    const ap = this.activeProcess;
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(
+            {
+              running: true,
+              connectedToGame: this.gameConnection?.connected ?? false,
+              interactionPort: this.interactionPort,
+              gamesStarted: ap.gamesStarted,
+              lastRepro: ap.lastRepro,
+              bufferedOutputLines: ap.output.length,
+              bufferedErrorLines: ap.errors.length,
+              droppedOutputLines: ap.droppedOutput,
+              droppedErrorLines: ap.droppedErrors,
+              bufferCap: MAX_BUFFER_LINES,
+            },
+            null,
+            2
+          ),
+        },
+      ],
+    };
+  }
+
+  /**
+   * Handle the clear_debug_output tool — drop the captured stdout/stderr lines
+   * and reset the consumer cursors without restarting the game. Preserves the
+   * cumulative gamesStarted / lastRepro counters (those describe the run, not
+   * the buffer). Lets a long session reclaim memory mid-flight.
+   */
+  private async handleClearDebugOutput() {
+    if (!this.activeProcess) {
+      return createErrorResponse('No active Godot process. Use run_project first.');
+    }
+    const ap = this.activeProcess;
+    const cleared = ap.output.length + ap.errors.length;
+    ap.output.length = 0;
+    ap.errors.length = 0;
+    ap.droppedOutput = 0;
+    ap.droppedErrors = 0;
+    this.lastLogIndex = 0;
+    this.lastErrorIndex = 0;
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(
+            { message: 'Debug buffers cleared', clearedLines: cleared, gamesStarted: ap.gamesStarted },
             null,
             2
           ),
@@ -3971,6 +4135,11 @@ class GodotServer {
       this.gameConnection.projectPath = null;
     }
 
+    // Return only a bounded tail. The buffers are already capped, but even
+    // MAX_BUFFER_LINES of a noisy game is large; the last ~80 lines are what
+    // matters at shutdown (crash backtrace, final state), and the full set is
+    // never useful enough to justify a multi-MB tool result.
+    const STOP_TAIL = 80;
     return {
       content: [
         {
@@ -3978,8 +4147,10 @@ class GodotServer {
           text: JSON.stringify(
             {
               message: 'Godot project stopped',
-              finalOutput: output,
-              finalErrors: errors,
+              totalOutputLines: output.length,
+              totalErrorLines: errors.length,
+              finalOutput: output.slice(-STOP_TAIL),
+              finalErrors: errors.slice(-STOP_TAIL),
             },
             null,
             2
