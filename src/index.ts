@@ -97,13 +97,26 @@ interface GodotServerConfig {
 }
 
 /**
+ * One in-flight game command, keyed by its request id.
+ * `timer` is kept so a resolved request can never also fire its timeout, and
+ * `command` so a timeout/diagnostic can name what was outstanding.
+ */
+interface PendingGameRequest {
+  resolve: (value: any) => void;
+  timer: ReturnType<typeof setTimeout>;
+  command: string;
+}
+
+/**
  * Interface for a TCP connection to the running game
  */
 interface GameConnection {
   socket: Socket | null;
   connected: boolean;
   responseBuffer: string;
-  pendingResolve: ((value: any) => void) | null;
+  // Request-id -> waiter. Insertion-ordered, which is what makes the id-less
+  // FIFO fallback in resolveGameResponse() well defined.
+  pendingRequests: Map<number, PendingGameRequest>;
   projectPath: string | null;
 }
 
@@ -123,9 +136,13 @@ class GodotServer {
     socket: null,
     connected: false,
     responseBuffer: '',
-    pendingResolve: null,
+    pendingRequests: new Map(),
     projectPath: null,
   };
+  // Monotonic request id stamped on every outbound game command. Starts at 1
+  // and only ever increases: the game reads a missing or negative id as
+  // "id-less request" and answers without an id, so 0/-1 must never be issued.
+  private nextRequestId: number = 1;
   private lastErrorIndex: number = 0;
   private lastLogIndex: number = 0;
   // Port for talking to the game's interaction server.
@@ -499,6 +516,9 @@ class GodotServer {
             this.gameConnection.socket = socket;
             this.gameConnection.connected = true;
             this.gameConnection.responseBuffer = '';
+            // A fresh socket can never answer anything queued against the old
+            // one; drain so the map starts empty and no timer outlives it.
+            this.resolveAllPending({ error: 'Connection closed' });
             this.logDebug(`Connected to game interaction server (attempt ${attempt})`);
             console.error(`[SERVER] Connected to game interaction server on port ${this.interactionPort}`);
 
@@ -509,12 +529,10 @@ class GodotServer {
                 const newlinePos = this.gameConnection.responseBuffer.indexOf('\n');
                 const line = this.gameConnection.responseBuffer.substring(0, newlinePos).trim();
                 this.gameConnection.responseBuffer = this.gameConnection.responseBuffer.substring(newlinePos + 1);
-                if (line.length > 0 && this.gameConnection.pendingResolve) {
+                if (line.length > 0) {
                   try {
                     const parsed = JSON.parse(line);
-                    const resolver = this.gameConnection.pendingResolve;
-                    this.gameConnection.pendingResolve = null;
-                    resolver(parsed);
+                    this.resolveGameResponse(parsed);
                   } catch (e) {
                     this.logDebug(`Failed to parse game response: ${line}`);
                   }
@@ -526,10 +544,7 @@ class GodotServer {
               this.logDebug('Game interaction connection closed');
               this.gameConnection.connected = false;
               this.gameConnection.socket = null;
-              if (this.gameConnection.pendingResolve) {
-                this.gameConnection.pendingResolve({ error: 'Connection closed' });
-                this.gameConnection.pendingResolve = null;
-              }
+              this.resolveAllPending({ error: 'Connection closed' });
             });
 
             socket.on('error', (err: Error) => {
@@ -592,32 +607,96 @@ class GodotServer {
     }
     this.gameConnection.connected = false;
     this.gameConnection.responseBuffer = '';
-    if (this.gameConnection.pendingResolve) {
-      this.gameConnection.pendingResolve({ error: 'Disconnected' });
-      this.gameConnection.pendingResolve = null;
-    }
+    this.resolveAllPending({ error: 'Disconnected' });
   }
 
   /**
-   * Send a command to the running game and wait for a response
+   * Terminally answer every in-flight request (connection lost / torn down).
+   * Timers are cleared first so a drained request can never also reject on
+   * timeout afterwards.
    */
-  private async sendGameCommand(command: string, params: Record<string, any> = {}, timeoutMs: number = 10000): Promise<any> {
+  private resolveAllPending(response: any): void {
+    for (const pending of this.gameConnection.pendingRequests.values()) {
+      clearTimeout(pending.timer);
+      pending.resolve(response);
+    }
+    this.gameConnection.pendingRequests.clear();
+  }
+
+  /**
+   * Route one parsed response line to the request that asked for it.
+   *
+   * The game echoes back the request `id` we stamped on the command, so
+   * responses correlate explicitly rather than by arrival order:
+   *
+   *  - numeric id we still hold  -> resolve exactly that request.
+   *  - numeric id we don't hold  -> STALE, drop it. Either our local timeout
+   *    already fired, or the game's busy force-reset already answered on that
+   *    id and the wedged handler's real reply is only now arriving. FIFO-ing a
+   *    stale payload would hand it to an unrelated in-flight command, which is
+   *    exactly the cross-talk the ids exist to prevent.
+   *  - no id field at all -> FIFO fallback: resolve the oldest pending request.
+   *    Keeps older game builds (which echo nothing) working, and covers the
+   *    game's rare id-less internal pushes.
+   */
+  private resolveGameResponse(parsed: any): void {
+    const pending = this.gameConnection.pendingRequests;
+
+    if (parsed && typeof parsed.id === 'number') {
+      const matched = pending.get(parsed.id);
+      if (!matched) {
+        this.logDebug(`Dropping stale game response for unknown request id ${parsed.id}`);
+        return;
+      }
+      clearTimeout(matched.timer);
+      pending.delete(parsed.id);
+      matched.resolve(parsed);
+      return;
+    }
+
+    // Map iteration is insertion-ordered, so the first key is the oldest request.
+    const oldestId = pending.keys().next();
+    if (oldestId.done) {
+      this.logDebug('Dropping id-less game response with no pending requests');
+      return;
+    }
+    const oldest = pending.get(oldestId.value)!;
+    clearTimeout(oldest.timer);
+    pending.delete(oldestId.value);
+    oldest.resolve(parsed);
+  }
+
+  /**
+   * Send a command to the running game and wait for a response.
+   *
+   * Default timeout is deliberately 12s, above the game's own 10s BUSY_TIMEOUT:
+   * when a handler wedges, the game's informative busy error should win the race
+   * and reach the caller instead of our generic local timeout. Per-command
+   * overrides (game_eval, spirits_*) stay at their own longer values.
+   */
+  private async sendGameCommand(command: string, params: Record<string, any> = {}, timeoutMs: number = 12000): Promise<any> {
     if (!this.gameConnection.connected || !this.gameConnection.socket) {
       throw new Error('Not connected to game interaction server. Is the game running?');
     }
 
-    const payload = JSON.stringify({ command, params }) + '\n';
+    const id = this.nextRequestId++;
+    const payload = JSON.stringify({ id, command, params }) + '\n';
 
     return new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => {
-        this.gameConnection.pendingResolve = null;
+      const timer = setTimeout(() => {
+        // Drop the waiter: a late reply on this id is now stale by definition.
+        this.gameConnection.pendingRequests.delete(id);
         reject(new Error(`Game command '${command}' timed out after ${timeoutMs / 1000}s`));
       }, timeoutMs);
 
-      this.gameConnection.pendingResolve = (response: any) => {
-        clearTimeout(timeout);
-        resolve(response);
-      };
+      this.gameConnection.pendingRequests.set(id, {
+        resolve: (response: any) => {
+          clearTimeout(timer);
+          resolve(response);
+        },
+        timer,
+        command,
+      });
 
       this.gameConnection.socket!.write(payload);
     });
@@ -733,7 +812,12 @@ class GodotServer {
 
       this.logDebug(`Executing: ${this.godotPath} ${args.join(' ')}`);
 
-      const { stdout, stderr } = await execFileAsync(this.godotPath!, args);
+      // GODOT_MCP_DISABLE tells the game's interaction-server autoload to stay
+      // down. Without it this short-lived headless run inherits the slot's
+      // pinned GODOT_MCP_PORT and squats the port the real game needs.
+      const { stdout, stderr } = await execFileAsync(this.godotPath!, args, {
+        env: { ...process.env, GODOT_MCP_DISABLE: '1' },
+      });
 
       return { stdout: stdout ?? '', stderr: stderr ?? '' };
     } catch (error: unknown) {
@@ -6749,7 +6833,9 @@ class GodotServer {
       const { stdout, stderr } = await execFileAsync(
         this.godotPath!,
         ['--headless', '--path', projectPath, '--script', this.validateScriptPath, scriptRes],
-        { timeout: 30000, maxBuffer: 16 * 1024 * 1024 }
+        // GODOT_MCP_DISABLE keeps this validation run from booting the game's
+        // interaction-server autoload and squatting the slot's GODOT_MCP_PORT.
+        { timeout: 30000, maxBuffer: 16 * 1024 * 1024, env: { ...process.env, GODOT_MCP_DISABLE: '1' } }
       );
       output = `${stdout ?? ''}${stderr ?? ''}`;
     } catch (error: any) {

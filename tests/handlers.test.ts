@@ -1150,6 +1150,141 @@ describe('Lifecycle handlers', () => {
 });
 
 // ---------------------------------------------------------------------------
+// 7a. Game response correlation (request ids)
+// ---------------------------------------------------------------------------
+describe('Game response correlation', () => {
+  const sendBlock = () =>
+    sourceCode.substring(
+      sourceCode.indexOf('private async sendGameCommand('),
+      sourceCode.indexOf('private async cleanup(')
+    );
+
+  const dispatchBlock = () =>
+    sourceCode.substring(
+      sourceCode.indexOf('private resolveGameResponse('),
+      sourceCode.indexOf('private async sendGameCommand(')
+    );
+
+  it('tracks in-flight requests in an id-keyed map, not a single resolver', () => {
+    expect(sourceCode).toContain('pendingRequests: Map<number, PendingGameRequest>');
+    expect(sourceCode).toContain('pendingRequests: new Map()');
+    expect(sourceCode).not.toContain('pendingResolve');
+  });
+
+  it('pending entries carry the resolver, its timer and the command name', () => {
+    const iface = sourceCode.substring(
+      sourceCode.indexOf('interface PendingGameRequest {'),
+      sourceCode.indexOf('interface GameConnection {')
+    );
+    expect(iface).toContain('resolve: (value: any) => void;');
+    expect(iface).toContain('timer: ReturnType<typeof setTimeout>;');
+    expect(iface).toContain('command: string;');
+  });
+
+  it('stamps a monotonic request id starting at 1 on every command', () => {
+    expect(sourceCode).toContain('private nextRequestId: number = 1;');
+    expect(sendBlock()).toContain('const id = this.nextRequestId++;');
+    expect(sendBlock()).toContain("JSON.stringify({ id, command, params }) + '\\n'");
+  });
+
+  it('registers the waiter in the pending map keyed by that id', () => {
+    expect(sendBlock()).toContain('this.gameConnection.pendingRequests.set(id, {');
+  });
+
+  it('timeout deletes the entry and names command + duration', () => {
+    expect(sendBlock()).toContain('this.gameConnection.pendingRequests.delete(id);');
+    expect(sendBlock()).toContain(
+      "reject(new Error(`Game command '${command}' timed out after ${timeoutMs / 1000}s`));"
+    );
+  });
+
+  it('defaults to a 12s timeout so the game\'s own busy error wins the race', () => {
+    expect(sourceCode).toContain(
+      'private async sendGameCommand(command: string, params: Record<string, any> = {}, timeoutMs: number = 12000)'
+    );
+  });
+
+  it('keeps the long per-command overrides untouched', () => {
+    expect(sourceCode).toContain("this.gameCommand('eval', args, a => ({ code: a.code }), 30000);");
+    expect(sourceCode).toContain("this.sendGameCommand('get_performance', {}, 8000)");
+  });
+
+  it('resolves a response whose id matches a pending request', () => {
+    expect(dispatchBlock()).toContain("typeof parsed.id === 'number'");
+    expect(dispatchBlock()).toContain('const matched = pending.get(parsed.id);');
+    expect(dispatchBlock()).toContain('pending.delete(parsed.id);');
+    expect(dispatchBlock()).toContain('matched.resolve(parsed);');
+  });
+
+  it('DROPS a response whose id is unknown (stale after timeout / force-reset)', () => {
+    expect(dispatchBlock()).toContain('if (!matched) {');
+    expect(dispatchBlock()).toContain(
+      'this.logDebug(`Dropping stale game response for unknown request id ${parsed.id}`);'
+    );
+    // The drop must return before reaching the FIFO fallback below it.
+    const dropIdx = dispatchBlock().indexOf('Dropping stale game response');
+    const fifoIdx = dispatchBlock().indexOf('pending.keys().next()');
+    expect(dropIdx).toBeGreaterThan(-1);
+    expect(fifoIdx).toBeGreaterThan(dropIdx);
+  });
+
+  it('falls back to FIFO only for responses with no id at all', () => {
+    expect(dispatchBlock()).toContain('const oldestId = pending.keys().next();');
+    expect(dispatchBlock()).toContain('if (oldestId.done) {');
+    expect(dispatchBlock()).toContain('pending.delete(oldestId.value);');
+    expect(dispatchBlock()).toContain('oldest.resolve(parsed);');
+  });
+
+  it('still drops unparseable lines with a debug log', () => {
+    expect(sourceCode).toContain('this.logDebug(`Failed to parse game response: ${line}`);');
+  });
+
+  it('drains every pending request on close and on disconnect', () => {
+    expect(sourceCode).toContain('private resolveAllPending(response: any): void {');
+    expect(sourceCode).toContain('clearTimeout(pending.timer);');
+    expect(sourceCode).toContain('this.gameConnection.pendingRequests.clear();');
+    expect(sourceCode).toContain("this.resolveAllPending({ error: 'Connection closed' });");
+    expect(sourceCode).toContain("this.resolveAllPending({ error: 'Disconnected' });");
+  });
+
+  it('receive path hands every parsed line to the correlator', () => {
+    expect(sourceCode).toContain('this.resolveGameResponse(parsed);');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 7a2. Short-lived Godot subprocesses must not squat the interaction port
+// ---------------------------------------------------------------------------
+describe('GODOT_MCP_DISABLE on short-lived Godot spawns', () => {
+  it('executeOperation disables the interaction server autoload', () => {
+    const block = sourceCode.substring(
+      sourceCode.indexOf('private async executeOperation('),
+      sourceCode.indexOf('private async getProjectStructure(')
+    );
+    expect(block).toContain("GODOT_MCP_DISABLE: '1'");
+    expect(block).toContain('env: { ...process.env,');
+  });
+
+  it('runGdScriptCheck disables the interaction server autoload', () => {
+    const block = sourceCode.substring(
+      sourceCode.indexOf('private async runGdScriptCheck('),
+      sourceCode.indexOf('private async handleValidateScript(')
+    );
+    expect(block).toContain("GODOT_MCP_DISABLE: '1'");
+    expect(block).toContain('env: { ...process.env,');
+  });
+
+  it('run_project does NOT disable it — that spawn is the real game', () => {
+    const block = sourceCode.substring(
+      sourceCode.indexOf('const spawnEnv = {'),
+      sourceCode.indexOf("const cmdArgs = ['-d', '--path', args.projectPath];")
+    );
+    expect(block).toContain('GODOT_MCP_PORT: String(this.interactionPort)');
+    expect(block).not.toContain('GODOT_MCP_DISABLE');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // 7b. Shader, audio, navigation, tilemap, collision, environment handlers
 // ---------------------------------------------------------------------------
 describe('Game command handlers — new tools (shader, audio, nav, tilemap, collision, env)', () => {

@@ -17,6 +17,10 @@ const BASE_PORT: int = 9090
 const PORT_SCAN_RANGE: int = 10
 var _bound_port: int = -1
 const BUSY_TIMEOUT: float = 30.0
+# Request id of the command currently being handled, echoed back on its
+# response so the MCP client can correlate replies instead of assuming strict
+# FIFO. -1 means the client sent no id (older build) and none is echoed.
+var _current_request_id: int = -1
 var _key_map: Dictionary
 var _held_keys: Dictionary = {}
 
@@ -113,6 +117,9 @@ func _handle_command(json_str: String) -> void:
 		return
 	_busy = true
 	_busy_since = Time.get_ticks_msec() / 1000.0
+	# Cleared up front so an early parse-error response can never inherit the
+	# previous command's id.
+	_current_request_id = -1
 
 	var json: JSON = JSON.new()
 	var parse_err: int = json.parse(json_str)
@@ -124,6 +131,14 @@ func _handle_command(json_str: String) -> void:
 	if not data is Dictionary:
 		_send_response({"error": "Expected JSON object"})
 		return
+
+	# Optional request id. JSON numbers may arrive as int or float; anything else
+	# (or a negative value) is treated as "no id" and simply not echoed.
+	var raw_id: Variant = (data as Dictionary).get("id", null)
+	if typeof(raw_id) == TYPE_INT or typeof(raw_id) == TYPE_FLOAT:
+		var parsed_id: int = int(raw_id)
+		if parsed_id >= 0:
+			_current_request_id = parsed_id
 
 	var command: String = data.get("command", "")
 	var params: Dictionary = data.get("params", {})
@@ -356,6 +371,9 @@ func _handle_command(json_str: String) -> void:
 func _send_response(data: Dictionary) -> void:
 	_busy = false
 	_busy_since = 0.0
+	if _current_request_id >= 0:
+		data["id"] = _current_request_id
+		_current_request_id = -1
 	_send_response_raw(data)
 
 
