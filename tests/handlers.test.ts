@@ -1277,7 +1277,7 @@ describe('GODOT_MCP_DISABLE on short-lived Godot spawns', () => {
   it('run_project does NOT disable it — that spawn is the real game', () => {
     const block = sourceCode.substring(
       sourceCode.indexOf('const spawnEnv = {'),
-      sourceCode.indexOf("const cmdArgs = ['-d', '--path', args.projectPath];")
+      sourceCode.indexOf('const cmdArgs = args.debug === false')
     );
     expect(block).toContain('GODOT_MCP_PORT: String(this.interactionPort)');
     expect(block).not.toContain('GODOT_MCP_DISABLE');
@@ -2219,7 +2219,7 @@ describe('Tool dispatch switch statement', () => {
     const caseRegex = /case '(\w+)':\s*\n\s*return await this\.handle/g;
     const matches = [...sourceCode.matchAll(caseRegex)];
     // Should match all dispatched tools (bump when adding/removing a case).
-    expect(matches.length).toBe(164);
+    expect(matches.length).toBe(167);
   });
 
   it('no case falls through without return', () => {

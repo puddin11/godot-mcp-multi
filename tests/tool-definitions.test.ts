@@ -66,6 +66,7 @@ const ALL_TOOL_NAMES = [
   'game_status', 'clear_debug_output',
   'spirits_state_probe', 'spirits_suspend_snapshot', 'spirits_boot_match',
   'spirits_inspect_card', 'spirits_observe', 'spirits_submit_command',
+  'spirits_forced_swap', 'spirits_session_dump', 'spirits_last_round',
 ];
 
 let sourceCode: string;
@@ -75,8 +76,8 @@ beforeAll(() => {
 });
 
 describe('Tool definitions', () => {
-  it('defines exactly 164 tools', () => {
-    expect(ALL_TOOL_NAMES).toHaveLength(164);
+  it('defines exactly 167 tools', () => {
+    expect(ALL_TOOL_NAMES).toHaveLength(167);
   });
 
   it('all tool names are unique', () => {

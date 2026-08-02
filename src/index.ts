@@ -78,6 +78,10 @@ interface GodotProcess {
   droppedErrors: number; // lines evicted from the front of errors[]
   gamesStarted: number; // count of [REPRO] markers seen on stdout (each = a fresh game)
   lastRepro: string | null; // most recent [REPRO] line, for cheap "where are we" checks
+  // Cumulative count of WATCHDOG lines for this child process's whole lifetime.
+  // Deliberately NOT per-session: the game-side counter resets on every reboot,
+  // so only the bridge can answer "did this build stall at all tonight?".
+  watchdogHits: number;
   portResolved: boolean; // once we learn the bound port, stop regex-scanning every stdout line
 }
 
@@ -1027,6 +1031,15 @@ class GodotServer {
               waitForReady: {
                 type: 'boolean',
                 description: 'Wait for the game TCP link plus one probe round-trip before returning.',
+              },
+              // Full intent (descriptions are capped at 80 chars by
+              // tests/tool-definitions.test.ts): default true; false launches
+              // without the local debugger so runtime script errors do not park
+              // the process at a debug> prompt. Used for interactive play
+              // sessions; soaks keep the default.
+              debug: {
+                type: 'boolean',
+                description: 'Default true. false = no local debugger, so errors do not park at debug>.',
               },
             },
             required: ['projectPath'],
@@ -3538,6 +3551,45 @@ class GodotServer {
             required: ['seat'],
           },
         },
+        // Answers a pending forced swap for a seat via the client UI path,
+        // which is what unblocks the client's event queue.
+        {
+          name: 'spirits_forced_swap',
+          description: 'Spirits: Unbound — answer a pending forced swap via the client UI path.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              seat: { type: 'integer', description: 'Player seat: 0 or 1.' },
+              reserveIndex: { type: 'integer', description: 'Reserve slot index to swap in.' },
+            },
+            required: ['seat', 'reserveIndex'],
+          },
+        },
+        // Server session state dump: waiting flags, planning/forced-swap
+        // timers, per-seat submissions, per-player board state.
+        {
+          name: 'spirits_session_dump',
+          description: 'Spirits: Unbound — session dump: waiting flags, timers, submissions, board.',
+          inputSchema: {
+            type: 'object',
+            properties: {},
+            required: [],
+          },
+        },
+        // Ordered event report for a resolved round: commands, damage
+        // breakdowns, poison, KOs, forced swaps. Fizzles are NOT yet in the
+        // event stream, so their absence from a report is not evidence.
+        {
+          name: 'spirits_last_round',
+          description: 'Spirits: Unbound — ordered event report for a resolved round. No fizzles yet.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              roundIndex: { type: 'integer', description: 'Round to report on. Defaults to the latest round with events.' },
+            },
+            required: [],
+          },
+        },
       ];
 
     this.server.setRequestHandler(ListToolsRequestSchema, async () => {
@@ -3617,6 +3669,12 @@ class GodotServer {
           return await this.handleSpiritsObserve(request.params.arguments);
         case 'spirits_submit_command':
           return await this.handleSpiritsSubmitCommand(request.params.arguments);
+        case 'spirits_forced_swap':
+          return await this.handleSpiritsForcedSwap(request.params.arguments);
+        case 'spirits_session_dump':
+          return await this.handleSpiritsSessionDump();
+        case 'spirits_last_round':
+          return await this.handleSpiritsLastRound(request.params.arguments);
         // New runtime interaction tools
         case 'game_eval':
           return await this.handleGameEval(request.params.arguments);
@@ -4040,7 +4098,12 @@ class GodotServer {
       }
       const spawnEnv = { ...globalThis.process.env, GODOT_MCP_PORT: String(this.interactionPort) };
 
-      const cmdArgs = ['-d', '--path', args.projectPath];
+      // `-d` attaches the local debugger, which parks the process at a `debug>`
+      // prompt on a runtime script error — fatal for an interactive play session
+      // driven over MCP. Opt out with debug:false; soaks keep the default.
+      const cmdArgs = args.debug === false
+        ? ['--path', args.projectPath]
+        : ['-d', '--path', args.projectPath];
       if (args.scene && validatePath(args.scene)) {
         this.logDebug(`Adding scene parameter: ${args.scene}`);
         cmdArgs.push(args.scene);
@@ -4078,6 +4141,7 @@ class GodotServer {
         droppedErrors: 0,
         gamesStarted: 0,
         lastRepro: null,
+        watchdogHits: 0,
         portResolved: false,
       };
       this.activeProcess = ap;
@@ -4155,7 +4219,7 @@ class GodotServer {
         content: [
           {
             type: 'text',
-            text: `Godot project started in debug mode. Use get_debug_output to see output. Game interaction server connecting on port ${this.interactionPort}...`,
+            text: `Godot project started${args.debug === false ? ' without the local debugger' : ' in debug mode'}. Use get_debug_output to see output. Game interaction server connecting on port ${this.interactionPort}...`,
           },
         ],
       };
@@ -4191,6 +4255,11 @@ class GodotServer {
       if (line.includes('[REPRO]')) {
         ap.gamesStarted++;
         ap.lastRepro = line.trim();
+      }
+      // Watchdog trips survive the reboot that clears the game-side counter, so
+      // count them here for the whole process lifetime.
+      if (line.includes('WATCHDOG')) {
+        ap.watchdogHits++;
       }
     }
     this.trimBuffer('output');
@@ -4247,6 +4316,7 @@ class GodotServer {
             {
               gamesStarted: ap.gamesStarted,
               lastRepro: ap.lastRepro,
+              watchdogHits: ap.watchdogHits,
               bufferedOutputLines: ap.output.length,
               bufferedErrorLines: ap.errors.length,
               droppedOutputLines: ap.droppedOutput,
@@ -4285,6 +4355,7 @@ class GodotServer {
               interactionPort: this.interactionPort,
               gamesStarted: ap.gamesStarted,
               lastRepro: ap.lastRepro,
+              watchdogHits: ap.watchdogHits,
               bufferedOutputLines: ap.output.length,
               bufferedErrorLines: ap.errors.length,
               droppedOutputLines: ap.droppedOutput,
@@ -5167,7 +5238,8 @@ class GodotServer {
   // ---- Spirits: Unbound — game-domain helpers ----
   // Dispatched server-side in C:/GodotGames/deckbuilder/scripts/mcp_interaction_server.gd
   // (commands: spirits_state_probe / spirits_suspend_snapshot / spirits_boot_match /
-  // spirits_inspect_card / spirits_observe / spirits_submit_command), implemented
+  // spirits_inspect_card / spirits_observe / spirits_submit_command /
+  // spirits_forced_swap / spirits_session_dump / spirits_last_round), implemented
   // in scripts/spirits_mcp_helpers.gd. These are
   // first-class MCP tools rather than game_eval wrappers so agents get autocomplete
   // and schema validation; they no-op cleanly when no game is running.
@@ -5216,6 +5288,23 @@ class GodotServer {
       if (a.externalControl !== undefined) out.external_control = a.externalControl;
       return out;
     });
+  }
+
+  private async handleSpiritsForcedSwap(args: any) {
+    return this.gameCommand('spirits_forced_swap', args, a => ({
+      seat: a.seat ?? 0,
+      reserve_index: a.reserveIndex ?? -1,
+    }), 30000);
+  }
+
+  private async handleSpiritsSessionDump() {
+    return this.gameCommand('spirits_session_dump', {}, () => ({}));
+  }
+
+  private async handleSpiritsLastRound(args: any) {
+    return this.gameCommand('spirits_last_round', args, a => ({
+      round_index: a.roundIndex ?? -1,
+    }), 30000);
   }
 
   private async handleGameGetProperty(args: any) {
