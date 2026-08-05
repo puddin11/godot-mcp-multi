@@ -1007,9 +1007,11 @@ describe('Handler source structure', () => {
   });
 
   it('gameCommand checks activeProcess and gameConnection', () => {
-    // Verify the gameCommand helper has the guard checks
+    // Verify the gameCommand helper has the guard checks. The connection
+    // gate goes through ensureGameConnection so a live game whose boot-time
+    // connect window was missed gets one on-demand attempt before failing.
     expect(sourceCode).toContain("if (!this.activeProcess) return createErrorResponse('No active Godot process");
-    expect(sourceCode).toContain("if (!this.gameConnection.connected) return createErrorResponse('Not connected");
+    expect(sourceCode).toContain("if (!(await this.ensureGameConnection())) return createErrorResponse('Not connected");
   });
 
   it('headlessOp validates projectPath and checks project.godot', () => {

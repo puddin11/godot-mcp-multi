@@ -161,6 +161,16 @@ class GodotServer {
   // and update interactionPort to match.
   private static readonly BASE_PORT = 9090;
   private static readonly PORT_SCAN_RANGE = 10;
+  // How long connectToGame keeps retrying after spawn before giving up, and
+  // the pause between attempts. The game's interaction autoload binds its
+  // port only after everything ahead of it in the boot sequence finishes
+  // (resource-DB indexing alone is ~6-8s on a mid-size project, more when
+  // several slots boot at once), so the window must comfortably exceed the
+  // slowest boot — a fixed handful of attempts loses that race by a hair and
+  // then never retries. Boots that report "MCP disabled" abort the wait
+  // early instead of running out the deadline.
+  private static readonly CONNECT_DEADLINE_MS = 30000;
+  private static readonly CONNECT_RETRY_MS = 500;
   private interactionPort: number;
   private interactionPortLocked: boolean;
   private readonly AUTOLOAD_NAME = 'McpInteractionServer';
@@ -495,84 +505,163 @@ class GodotServer {
   }
 
   /**
-   * Connect to the game's TCP interaction server with retries.
-   * Resolves true once the socket is up, false if the process died first or
-   * every attempt failed — callers (waitForReady) must be able to tell.
+   * One TCP connect attempt against the game's interaction server. On success
+   * the socket is wired into gameConnection (data/close/error handlers
+   * attached) and the promise resolves; on failure it rejects. Shared by the
+   * boot-time retry loop (connectToGame) and the lazy on-demand path
+   * (ensureGameConnection).
+   */
+  private attemptGameConnection(ap: GodotProcess): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      const socket = createConnection({ host: '127.0.0.1', port: this.interactionPort }, () => {
+        // The slot may have been rebooted while this attempt was in flight —
+        // a socket to a stale process must not be wired in as current.
+        if (this.activeProcess !== ap) {
+          socket.destroy();
+          reject(new Error('slot rebooted during connect'));
+          return;
+        }
+        // Another attempt (boot loop vs lazy path) may have won the race;
+        // keep the established link and discard this one.
+        if (this.gameConnection.connected && this.gameConnection.socket && this.gameConnection.socket !== socket) {
+          socket.destroy();
+          resolve();
+          return;
+        }
+        this.gameConnection.socket = socket;
+        this.gameConnection.connected = true;
+        this.gameConnection.responseBuffer = '';
+        // A fresh socket can never answer anything queued against the old
+        // one; drain so the map starts empty and no timer outlives it.
+        this.resolveAllPending({ error: 'Connection closed' });
+
+        socket.on('data', (data: Buffer) => {
+          this.gameConnection.responseBuffer += data.toString();
+          // Process complete lines
+          while (this.gameConnection.responseBuffer.includes('\n')) {
+            const newlinePos = this.gameConnection.responseBuffer.indexOf('\n');
+            const line = this.gameConnection.responseBuffer.substring(0, newlinePos).trim();
+            this.gameConnection.responseBuffer = this.gameConnection.responseBuffer.substring(newlinePos + 1);
+            if (line.length > 0) {
+              try {
+                const parsed = JSON.parse(line);
+                this.resolveGameResponse(parsed);
+              } catch (e) {
+                this.logDebug(`Failed to parse game response: ${line}`);
+              }
+            }
+          }
+        });
+
+        socket.on('close', () => {
+          this.logDebug('Game interaction connection closed');
+          this.gameConnection.connected = false;
+          this.gameConnection.socket = null;
+          this.resolveAllPending({ error: 'Connection closed' });
+        });
+
+        socket.on('error', (err: Error) => {
+          this.logDebug(`Game interaction socket error: ${err.message}`);
+        });
+
+        resolve();
+      });
+
+      socket.on('error', (err: Error) => {
+        reject(err);
+      });
+    });
+  }
+
+  /**
+   * True when the spawned game has printed that its interaction server will
+   * never come up this run — the autoload's "GODOT_MCP_PORT=N busy, MCP
+   * disabled" / "no free port ..., MCP disabled this session" warnings. Lets
+   * the connect loop fail fast instead of running out the full deadline.
+   */
+  private mcpUnavailableForRun(ap: GodotProcess): boolean {
+    const marker = 'MCP disabled';
+    return ap.errors.some(line => line.includes(marker)) || ap.output.some(line => line.includes(marker));
+  }
+
+  /**
+   * Connect to the game's TCP interaction server, retrying until the deadline.
+   * Resolves true once the socket is up, false if the process died / was
+   * replaced first, the game declared MCP unavailable, or the deadline passed
+   * — callers (waitForReady) must be able to tell.
    */
   private async connectToGame(projectPath: string): Promise<boolean> {
     this.gameConnection.projectPath = projectPath;
+    const ap = this.activeProcess;
+    if (!ap) {
+      this.logDebug('No game process at connect start, aborting connection');
+      return false;
+    }
+    const deadline = Date.now() + GodotServer.CONNECT_DEADLINE_MS;
 
     // Initial delay to let the game start up
     await new Promise(resolve => setTimeout(resolve, 2000));
 
-    const maxAttempts = 10;
-    const retryDelay = 500;
-
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-      if (!this.activeProcess) {
-        this.logDebug('Game process no longer running, aborting connection');
+    let attempt = 0;
+    while (true) {
+      if (this.activeProcess !== ap) {
+        this.logDebug('Game process no longer current, aborting connection');
+        return false;
+      }
+      if (this.gameConnection.connected && this.gameConnection.socket) {
+        // The lazy path connected while this loop slept.
+        return true;
+      }
+      if (this.mcpUnavailableForRun(ap)) {
+        console.error('[SERVER] Game reports "MCP disabled" — interaction server will not come up this run, aborting connect.');
         return false;
       }
 
+      attempt++;
       try {
-        await new Promise<void>((resolve, reject) => {
-          const socket = createConnection({ host: '127.0.0.1', port: this.interactionPort }, () => {
-            this.gameConnection.socket = socket;
-            this.gameConnection.connected = true;
-            this.gameConnection.responseBuffer = '';
-            // A fresh socket can never answer anything queued against the old
-            // one; drain so the map starts empty and no timer outlives it.
-            this.resolveAllPending({ error: 'Connection closed' });
-            this.logDebug(`Connected to game interaction server (attempt ${attempt})`);
-            console.error(`[SERVER] Connected to game interaction server on port ${this.interactionPort}`);
-
-            socket.on('data', (data: Buffer) => {
-              this.gameConnection.responseBuffer += data.toString();
-              // Process complete lines
-              while (this.gameConnection.responseBuffer.includes('\n')) {
-                const newlinePos = this.gameConnection.responseBuffer.indexOf('\n');
-                const line = this.gameConnection.responseBuffer.substring(0, newlinePos).trim();
-                this.gameConnection.responseBuffer = this.gameConnection.responseBuffer.substring(newlinePos + 1);
-                if (line.length > 0) {
-                  try {
-                    const parsed = JSON.parse(line);
-                    this.resolveGameResponse(parsed);
-                  } catch (e) {
-                    this.logDebug(`Failed to parse game response: ${line}`);
-                  }
-                }
-              }
-            });
-
-            socket.on('close', () => {
-              this.logDebug('Game interaction connection closed');
-              this.gameConnection.connected = false;
-              this.gameConnection.socket = null;
-              this.resolveAllPending({ error: 'Connection closed' });
-            });
-
-            socket.on('error', (err: Error) => {
-              this.logDebug(`Game interaction socket error: ${err.message}`);
-            });
-
-            resolve();
-          });
-
-          socket.on('error', (err: Error) => {
-            reject(err);
-          });
-        });
-
-        // Successfully connected
+        await this.attemptGameConnection(ap);
+        this.logDebug(`Connected to game interaction server (attempt ${attempt})`);
+        console.error(`[SERVER] Connected to game interaction server on port ${this.interactionPort} (attempt ${attempt})`);
         return true;
       } catch (err) {
-        this.logDebug(`Connection attempt ${attempt}/${maxAttempts} failed, retrying in ${retryDelay}ms...`);
-        await new Promise(resolve => setTimeout(resolve, retryDelay));
+        if (Date.now() >= deadline) break;
+        this.logDebug(`Connection attempt ${attempt} failed, retrying in ${GodotServer.CONNECT_RETRY_MS}ms...`);
+        await new Promise(resolve => setTimeout(resolve, GodotServer.CONNECT_RETRY_MS));
       }
     }
 
-    console.error(`[SERVER] Failed to connect to game interaction server after ${maxAttempts} attempts`);
+    console.error(`[SERVER] Failed to connect to game interaction server after ${attempt} attempts over ${Math.round(GodotServer.CONNECT_DEADLINE_MS / 1000)}s`);
     return false;
+  }
+
+  /**
+   * Ensure the interaction socket is up, attempting one immediate connect when
+   * a live game exists but the link is down — a boot whose connect window was
+   * missed, or a link that dropped while the game kept running. Concurrent
+   * callers coalesce onto one in-flight attempt. Returns whether the link is
+   * usable afterwards.
+   */
+  private lazyConnectPromise: Promise<boolean> | null = null;
+
+  private async ensureGameConnection(): Promise<boolean> {
+    if (this.gameConnection.connected && this.gameConnection.socket) return true;
+    const ap = this.activeProcess;
+    if (!ap) return false;
+    if (this.lazyConnectPromise) return this.lazyConnectPromise;
+    this.lazyConnectPromise = (async () => {
+      try {
+        if (this.gameConnection.connected && this.gameConnection.socket) return true;
+        await this.attemptGameConnection(ap);
+        console.error(`[SERVER] Late-connected to game interaction server on port ${this.interactionPort}`);
+        return true;
+      } catch (err) {
+        this.logDebug(`Lazy connect attempt failed: ${err}`);
+        return false;
+      } finally {
+        this.lazyConnectPromise = null;
+      }
+    })();
+    return this.lazyConnectPromise;
   }
 
   /**
@@ -731,7 +820,7 @@ class GodotServer {
     timeoutMs?: number
   ): Promise<any> {
     if (!this.activeProcess) return createErrorResponse('No active Godot process. Use run_project first.');
-    if (!this.gameConnection.connected) return createErrorResponse('Not connected to game interaction server.');
+    if (!(await this.ensureGameConnection())) return createErrorResponse('Not connected to game interaction server.');
     args = normalizeParameters(args || {});
     try {
       const response = await this.sendGameCommand(name, argsFn(args), timeoutMs);
@@ -4156,12 +4245,17 @@ class GodotServer {
 
       process.on('exit', (code: number | null) => {
         this.logDebug(`Godot process exited with code ${code}`);
-        this.disconnectFromGame();
-        if (this.gameConnection.projectPath) {
-          this.removeInteractionServer(this.gameConnection.projectPath);
-          this.gameConnection.projectPath = null;
-        }
+        // Only tear down when the exiting process is still the tracked one.
+        // A replacement run_project already disconnected and cleaned up the
+        // old game synchronously before spawning; letting this stale handler
+        // run unconditionally would disconnect the NEW game's socket and
+        // strip its injected autoload mid-boot.
         if (this.activeProcess && this.activeProcess.process === process) {
+          this.disconnectFromGame();
+          if (this.gameConnection.projectPath) {
+            this.removeInteractionServer(this.gameConnection.projectPath);
+            this.gameConnection.projectPath = null;
+          }
           this.activeProcess = null;
         }
       });
@@ -5174,7 +5268,7 @@ class GodotServer {
     if (!this.activeProcess) {
       return createErrorResponse('No active Godot process. Use run_project first.');
     }
-    if (!this.gameConnection.connected) {
+    if (!(await this.ensureGameConnection())) {
       return createErrorResponse('Not connected to game interaction server. Wait a moment and try again.');
     }
 
