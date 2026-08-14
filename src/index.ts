@@ -3824,6 +3824,19 @@ class GodotServer {
             properties: {
               runtimeId: { type: 'integer', description: 'Runtime card ID to look up in the live board. Use this OR cardId, not both.' },
               cardId: { type: 'string', description: 'Template id (e.g. fire_imp) — base stats from cardDB. Not with runtimeId.' },
+              // Runtime ids are PER-PLAYER (each Deck numbers from 0), so both
+              // players routinely hold the same rid — the default both-sides
+              // scan returns player_a's card on a collision; `side` scopes the
+              // scan to one player. fairPlay (with seat) honors the seat's
+              // hidden-information boundary on runtimeId hits: opponent
+              // hand/deck hits are refused as reject_reason "hidden_zone", an
+              // own-deck hit keeps the card but blanks its [index] from
+              // found_in (draw order is hidden even from the owner), and the
+              // seat's own side is scanned first on collisions. cardId
+              // template lookups are always public.
+              side: { type: 'integer', description: 'Scan one player only: 0 (player_a) or 1 (player_b). Default both, a first.' },
+              fairPlay: { type: 'boolean', description: 'Refuse runtimeId hits hidden from seat (opp hand/deck). Default false.' },
+              seat: { type: 'integer', description: 'Viewing seat for fairPlay: 0 or 1.' },
             },
             required: [],
           },
@@ -3896,7 +3909,16 @@ class GodotServer {
           description: 'Spirits: Unbound — session dump: waiting flags, timers, submissions, board.',
           inputSchema: {
             type: 'object',
-            properties: {},
+            properties: {
+              // fairPlay (with seat) rewrites the OPPONENT's queued-command
+              // counts in the dump text ("p1=3 cmds" → "p1=submitted",
+              // "queue=…" → "queue=<withheld>") — the count is the nova tell a
+              // playing agent must not have. Commit STATUS stays visible (the
+              // structured player_commands_received booleans are untouched)
+              // because a real client is told when its opponent is ready.
+              fairPlay: { type: 'boolean', description: "Withhold the opponent's queued-command count from the dump. Default false." },
+              seat: { type: 'integer', description: 'Viewing seat for fairPlay: 0 or 1.' },
+            },
             required: [],
           },
         },
@@ -3910,6 +3932,15 @@ class GodotServer {
             type: 'object',
             properties: {
               roundIndex: { type: 'integer', description: 'Round to report on. Defaults to the latest round with events.' },
+              // fairPlay (with seat) runs the round slice through the game's
+              // EventLog.filter_for_viewer — the EXACT per-viewer redaction a
+              // real client of that seat receives on the wire (#198): the
+              // opponent's CARD_DRAWN card ids are blanked, omniscient events
+              // are dropped, and unrecognized owner-only subtypes are dropped
+              // fail-closed. A fair-play report can never show more than the
+              // seat's own client renders.
+              fairPlay: { type: 'boolean', description: 'Per-viewer event filter: exactly what a client of seat sees. Default false.' },
+              seat: { type: 'integer', description: 'Viewing seat for fairPlay: 0 or 1.' },
             },
             required: [],
           },
@@ -5794,6 +5825,9 @@ class GodotServer {
       const out: Record<string, any> = {};
       if (a.runtimeId !== undefined) out.runtime_id = a.runtimeId;
       if (a.cardId !== undefined) out.card_id = a.cardId;
+      if (a.side !== undefined) out.side = a.side;
+      if (a.fairPlay !== undefined) out.fair_play = a.fairPlay;
+      if (a.seat !== undefined) out.seat = a.seat;
       return out;
     });
   }
@@ -5835,13 +5869,21 @@ class GodotServer {
   }
 
   private async handleSpiritsSessionDump(args?: any) {
-    return this.gameCommand('spirits_session_dump', args, () => ({}));
+    return this.gameCommand('spirits_session_dump', args, a => {
+      const out: Record<string, any> = {};
+      if (a.fairPlay !== undefined) out.fair_play = a.fairPlay;
+      if (a.seat !== undefined) out.seat = a.seat;
+      return out;
+    });
   }
 
   private async handleSpiritsLastRound(args: any) {
-    return this.gameCommand('spirits_last_round', args, a => ({
-      round_index: a.roundIndex ?? -1,
-    }), 30000);
+    return this.gameCommand('spirits_last_round', args, a => {
+      const out: Record<string, any> = { round_index: a.roundIndex ?? -1 };
+      if (a.fairPlay !== undefined) out.fair_play = a.fairPlay;
+      if (a.seat !== undefined) out.seat = a.seat;
+      return out;
+    }, 30000);
   }
 
   private async handleGameGetProperty(args: any) {
