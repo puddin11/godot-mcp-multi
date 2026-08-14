@@ -1377,6 +1377,18 @@ class GodotServer {
             required: [],
           },
         },
+        // The registry index, and the only game-aware tool with no `game`
+        // parameter — every other one points you here when a name is missing
+        // or ambiguous, so it must be answerable without knowing a name.
+        {
+          name: 'list_games',
+          description: 'List tracked games: name, pid, port, status, uptime, buffers, counters.',
+          inputSchema: {
+            type: 'object',
+            properties: {},
+            required: [],
+          },
+        },
         {
           name: 'get_godot_version',
           description: 'Get the installed Godot version',
@@ -3839,7 +3851,12 @@ class GodotServer {
               seat: { type: 'integer', description: 'Player seat: 0 or 1.' },
               commands: { type: 'array', items: { type: 'object' }, description: 'Command dicts: type, card_runtime_ID, play_location, card_ID.' },
               externalControl: { type: 'boolean', description: 'Set or clear AI-seat takeover. Omit to leave unchanged.' },
-              dropDrawCommands: { type: 'boolean', description: 'Strip DRAW_CARD/DRAW_CARD_FREE from the batch instead of refusing it (count comes back as dropped_draws). Draw with spirits_draw_card instead. Default false.' },
+              // Full intent (descriptions are capped at 80 chars by
+              // tests/tool-definitions.test.ts): DRAW_CARD* means DRAW_CARD and
+              // DRAW_CARD_FREE. Default false, i.e. a batch containing either
+              // is refused outright rather than silently trimmed. Draws are a
+              // multi-frame client gesture — use spirits_draw_card for them.
+              dropDrawCommands: { type: 'boolean', description: 'Strip DRAW_CARD* from the batch; count returned as dropped_draws. Default false.' },
             },
             required: ['seat'],
           },
@@ -3899,6 +3916,26 @@ class GodotServer {
         },
       ];
 
+    // Every game-facing tool takes an optional `game` selector, so that a
+    // second tracked game can be addressed by name. Stamped on programmatically
+    // rather than by hand: it is one property on ~125 schema literals, and a
+    // loop can't miss one or drift out of sync with the resolver the way 125
+    // copy-pasted blocks would. The `game_`/`spirits_` prefixes cover every
+    // tool that round-trips to a game's socket; the Set adds the four bridge
+    // tools that address a record without talking to it. `list_games` is
+    // deliberately outside both — it is how you learn the names in the first
+    // place. This runs before ListTools registers its closure over ALL_TOOLS,
+    // so both listing and profile filtering serve the augmented schemas.
+    const GAME_SCOPED_EXTRA = new Set(['run_project', 'stop_project', 'get_debug_output', 'clear_debug_output']);
+    for (const tool of ALL_TOOLS) {
+      if (tool.name.startsWith('game_') || tool.name.startsWith('spirits_') || GAME_SCOPED_EXTRA.has(tool.name)) {
+        (tool.inputSchema.properties as Record<string, unknown>).game = {
+          type: 'string',
+          description: 'Game name. Optional when exactly one game exists.',
+        };
+      }
+    }
+
     this.server.setRequestHandler(ListToolsRequestSchema, async () => {
       const disabled = this.getDisabledTools();
       return {
@@ -3926,11 +3963,13 @@ class GodotServer {
         case 'get_debug_output':
           return await this.handleGetDebugOutput(request.params.arguments);
         case 'game_status':
-          return await this.handleGameStatus();
+          return await this.handleGameStatus(request.params.arguments);
         case 'clear_debug_output':
-          return await this.handleClearDebugOutput();
+          return await this.handleClearDebugOutput(request.params.arguments);
         case 'stop_project':
-          return await this.handleStopProject();
+          return await this.handleStopProject(request.params.arguments);
+        case 'list_games':
+          return await this.handleListGames();
         case 'get_godot_version':
           return await this.handleGetGodotVersion();
         case 'list_projects':
@@ -3952,7 +3991,7 @@ class GodotServer {
         case 'update_project_uids':
           return await this.handleUpdateProjectUids(request.params.arguments);
         case 'game_screenshot':
-          return await this.handleGameScreenshot();
+          return await this.handleGameScreenshot(request.params.arguments);
         case 'game_click':
           return await this.handleGameClick(request.params.arguments);
         case 'game_key_press':
@@ -3960,14 +3999,14 @@ class GodotServer {
         case 'game_mouse_move':
           return await this.handleGameMouseMove(request.params.arguments);
         case 'game_get_ui':
-          return await this.handleGameGetUi();
+          return await this.handleGameGetUi(request.params.arguments);
         case 'game_get_scene_tree':
-          return await this.handleGameGetSceneTree();
+          return await this.handleGameGetSceneTree(request.params.arguments);
         // Spirits: Unbound — game-domain helpers
         case 'spirits_state_probe':
-          return await this.handleSpiritsStateProbe();
+          return await this.handleSpiritsStateProbe(request.params.arguments);
         case 'spirits_suspend_snapshot':
-          return await this.handleSpiritsSuspendSnapshot();
+          return await this.handleSpiritsSuspendSnapshot(request.params.arguments);
         case 'spirits_boot_match':
           return await this.handleSpiritsBootMatch(request.params.arguments);
         case 'spirits_inspect_card':
@@ -3981,7 +4020,7 @@ class GodotServer {
         case 'spirits_forced_swap':
           return await this.handleSpiritsForcedSwap(request.params.arguments);
         case 'spirits_session_dump':
-          return await this.handleSpiritsSessionDump();
+          return await this.handleSpiritsSessionDump(request.params.arguments);
         case 'spirits_last_round':
           return await this.handleSpiritsLastRound(request.params.arguments);
         // New runtime interaction tools
@@ -4004,7 +4043,7 @@ class GodotServer {
         case 'game_pause':
           return await this.handleGamePause(request.params.arguments);
         case 'game_performance':
-          return await this.handleGamePerformance();
+          return await this.handleGamePerformance(request.params.arguments);
         case 'game_wait':
           return await this.handleGameWait(request.params.arguments);
         // Headless scene tools
@@ -4054,9 +4093,9 @@ class GodotServer {
           return await this.handleCreateDirectory(request.params.arguments);
         // Error/Log capture tools
         case 'game_get_errors':
-          return await this.handleGameGetErrors();
+          return await this.handleGameGetErrors(request.params.arguments);
         case 'game_get_logs':
-          return await this.handleGameGetLogs();
+          return await this.handleGameGetLogs(request.params.arguments);
         // Enhanced input tools
         case 'game_key_hold':
           return await this.handleGameKeyHold(request.params.arguments);
@@ -4079,13 +4118,13 @@ class GodotServer {
           return await this.handleManageExportPresets(request.params.arguments);
         // Advanced runtime tools
         case 'game_get_camera':
-          return await this.handleGameGetCamera();
+          return await this.handleGameGetCamera(request.params.arguments);
         case 'game_set_camera':
           return await this.handleGameSetCamera(request.params.arguments);
         case 'game_raycast':
           return await this.handleGameRaycast(request.params.arguments);
         case 'game_get_audio':
-          return await this.handleGameGetAudio();
+          return await this.handleGameGetAudio(request.params.arguments);
         case 'game_spawn_node':
           return await this.handleGameSpawnNode(request.params.arguments);
         // Shader, audio, navigation, tilemap, collision, environment tools
@@ -4922,6 +4961,55 @@ class GodotServer {
   }
 
   /**
+   * Handle the list_games tool — the whole registry in one shot: which names
+   * exist, what they are doing, and what the exited ones left behind.
+   *
+   * Takes no `game` parameter by design. Every other game-facing tool answers
+   * an unknown or ambiguous name by naming this tool, so it has to work when
+   * the caller knows nothing — including when the registry is empty, where it
+   * returns an empty `games` array rather than the legacy "no active process"
+   * error. `portRange`/`legacyPinned` describe the window those ports came
+   * from, which is what makes an unexpected port or a refused allocation
+   * diagnosable from a single call.
+   */
+  private async handleListGames() {
+    const now = Date.now();
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(
+            {
+              portRange: `${this.portLo}-${this.portHi}`,
+              legacyPinned: this.legacyPinned,
+              games: [...this.games.values()].map(rec => ({
+                name: rec.name,
+                status: rec.status,
+                pid: rec.pid,
+                port: rec.port,
+                exitCode: rec.exitCode,
+                // Lifetime for a corpse, age for a live game.
+                uptimeMs: (rec.exitedAt ?? now) - rec.startedAt,
+                projectPath: rec.projectPath,
+                connected: rec.connected,
+                gamesStarted: rec.gamesStarted,
+                lastRepro: rec.lastRepro,
+                watchdogHits: rec.watchdogHits,
+                bufferedOutputLines: rec.output.length,
+                bufferedErrorLines: rec.errors.length,
+                droppedOutputLines: rec.droppedOutput,
+                droppedErrorLines: rec.droppedErrors,
+              })),
+            },
+            null,
+            2
+          ),
+        },
+      ],
+    };
+  }
+
+  /**
    * Handle the get_godot_version tool
    */
   private async handleGetGodotVersion() {
@@ -5654,12 +5742,15 @@ class GodotServer {
     }));
   }
 
-  private async handleGameGetUi() {
-    return this.gameCommand('get_ui_elements', {}, () => ({}));
+  // The payload-less tools still forward `args`: the argsFn ignores it, but
+  // gameCommand reads `args.game` to pick the record. Passing `{}` here would
+  // silently strip the selector and always resolve to the sole/first game.
+  private async handleGameGetUi(args?: any) {
+    return this.gameCommand('get_ui_elements', args, () => ({}));
   }
 
-  private async handleGameGetSceneTree() {
-    return this.gameCommand('get_scene_tree', {}, () => ({}));
+  private async handleGameGetSceneTree(args?: any) {
+    return this.gameCommand('get_scene_tree', args, () => ({}));
   }
 
   private async handleGameEval(args: any) {
@@ -5678,12 +5769,12 @@ class GodotServer {
   // first-class MCP tools rather than game_eval wrappers so agents get autocomplete
   // and schema validation; they no-op cleanly when no game is running.
 
-  private async handleSpiritsStateProbe() {
-    return this.gameCommand('spirits_state_probe', {}, () => ({}));
+  private async handleSpiritsStateProbe(args?: any) {
+    return this.gameCommand('spirits_state_probe', args, () => ({}));
   }
 
-  private async handleSpiritsSuspendSnapshot() {
-    return this.gameCommand('spirits_suspend_snapshot', {}, () => ({}));
+  private async handleSpiritsSuspendSnapshot(args?: any) {
+    return this.gameCommand('spirits_suspend_snapshot', args, () => ({}));
   }
 
   private async handleSpiritsBootMatch(args: any) {
@@ -5743,8 +5834,8 @@ class GodotServer {
     }), 30000);
   }
 
-  private async handleSpiritsSessionDump() {
-    return this.gameCommand('spirits_session_dump', {}, () => ({}));
+  private async handleSpiritsSessionDump(args?: any) {
+    return this.gameCommand('spirits_session_dump', args, () => ({}));
   }
 
   private async handleSpiritsLastRound(args: any) {
@@ -5805,8 +5896,8 @@ class GodotServer {
     return this.gameCommand('pause', args, a => ({ paused: a.paused !== undefined ? a.paused : true }));
   }
 
-  private async handleGamePerformance() {
-    return this.gameCommand('get_performance', {}, () => ({}));
+  private async handleGamePerformance(args?: any) {
+    return this.gameCommand('get_performance', args, () => ({}));
   }
 
   private async handleGameWait(args: any) {
@@ -6525,8 +6616,8 @@ class GodotServer {
 
   // --- Advanced runtime handlers ---
 
-  private async handleGameGetCamera() {
-    return this.gameCommand('get_camera', {}, () => ({}));
+  private async handleGameGetCamera(args?: any) {
+    return this.gameCommand('get_camera', args, () => ({}));
   }
 
   private async handleGameSetCamera(args: any) {
@@ -6547,8 +6638,8 @@ class GodotServer {
     }));
   }
 
-  private async handleGameGetAudio() {
-    return this.gameCommand('get_audio', {}, () => ({}));
+  private async handleGameGetAudio(args?: any) {
+    return this.gameCommand('get_audio', args, () => ({}));
   }
 
   private async handleGameSpawnNode(args: any) {
