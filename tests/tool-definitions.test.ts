@@ -7,6 +7,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 
 const ALL_TOOL_NAMES = [
   'launch_editor', 'run_project', 'get_debug_output', 'stop_project',
+  'list_games',
   'get_godot_version', 'list_projects', 'get_project_info', 'create_scene',
   'add_node', 'load_sprite', 'export_mesh_library', 'save_scene',
   'get_uid', 'update_project_uids', 'game_screenshot', 'game_click',
@@ -66,6 +67,7 @@ const ALL_TOOL_NAMES = [
   'game_status', 'clear_debug_output',
   'spirits_state_probe', 'spirits_suspend_snapshot', 'spirits_boot_match',
   'spirits_inspect_card', 'spirits_observe', 'spirits_submit_command',
+  'spirits_draw_card',
   'spirits_forced_swap', 'spirits_session_dump', 'spirits_last_round',
 ];
 
@@ -76,8 +78,8 @@ beforeAll(() => {
 });
 
 describe('Tool definitions', () => {
-  it('defines exactly 167 tools', () => {
-    expect(ALL_TOOL_NAMES).toHaveLength(167);
+  it('defines exactly 169 tools', () => {
+    expect(ALL_TOOL_NAMES).toHaveLength(169);
   });
 
   it('all tool names are unique', () => {
@@ -126,6 +128,31 @@ describe('Tool definitions', () => {
       if (desc.length > 80) {
         expect.fail(`Description too long (${desc.length} chars): "${desc}"`);
       }
+    }
+  });
+
+  it('stamps the optional `game` selector onto every game-facing schema', () => {
+    // The selector is applied by one post-processing loop over ALL_TOOLS
+    // rather than by hand on ~125 schema literals, so a substring scan of the
+    // literals cannot see it. Pin the loop itself: deleting it would silently
+    // strip `game` from every schema while every other test still passed.
+    expect(sourceCode).toContain(
+      "const GAME_SCOPED_EXTRA = new Set(['run_project', 'stop_project', 'get_debug_output', 'clear_debug_output']);"
+    );
+    expect(sourceCode).toContain(
+      "if (tool.name.startsWith('game_') || tool.name.startsWith('spirits_') || GAME_SCOPED_EXTRA.has(tool.name)) {"
+    );
+    expect(sourceCode).toContain("description: 'Game name. Optional when exactly one game exists.',");
+  });
+
+  it('no tool makes `game` required', () => {
+    // Omitting `game` is the single-game shorthand every pre-existing caller
+    // relies on. A required `game` anywhere would break that contract.
+    const requiredRegex = /required:\s*\[([^\]]*)\]/g;
+    const matches = [...sourceCode.matchAll(requiredRegex)];
+    for (const match of matches) {
+      const required = match[1].match(/'([^']+)'/g)?.map(s => s.replace(/'/g, '')) || [];
+      expect(required).not.toContain('game');
     }
   });
 

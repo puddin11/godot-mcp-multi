@@ -1006,12 +1006,28 @@ describe('Handler source structure', () => {
     }
   });
 
-  it('gameCommand checks activeProcess and gameConnection', () => {
-    // Verify the gameCommand helper has the guard checks. The connection
-    // gate goes through ensureGameConnection so a live game whose boot-time
-    // connect window was missed gets one on-demand attempt before failing.
-    expect(sourceCode).toContain("if (!this.activeProcess) return createErrorResponse('No active Godot process");
-    expect(sourceCode).toContain("if (!(await this.ensureGameConnection())) return createErrorResponse('Not connected");
+  it('gameCommand resolves a game record, then gates on liveness and connection', () => {
+    // Verify the gameCommand helper has the guard checks, in order. The `game`
+    // selector is resolved first; with no games tracked the resolver echoes the
+    // caller's legacy wording verbatim, which external probers match on. A
+    // resolved corpse is refused before the connection is touched, and the
+    // connection gate itself goes through ensureGameConnection so a live game
+    // whose boot-time connect window was missed gets one on-demand attempt
+    // before failing.
+    const gameCommandBlock = sourceCode.substring(
+      sourceCode.indexOf('private async gameCommand('),
+      sourceCode.indexOf('private async headlessOp(')
+    );
+    expect(gameCommandBlock).toContain(
+      "const resolved = this.resolveGame(args, 'No active Godot process. Use run_project first.');"
+    );
+    expect(gameCommandBlock).toContain('if (resolved.err) return createErrorResponse(resolved.err);');
+    expect(gameCommandBlock).toContain(
+      "if (rec.status === 'exited') return createErrorResponse(this.exitedGameError(rec));"
+    );
+    expect(gameCommandBlock).toContain(
+      "if (!(await this.ensureGameConnection(rec))) return createErrorResponse('Not connected"
+    );
   });
 
   it('headlessOp validates projectPath and checks project.godot', () => {
@@ -1074,18 +1090,20 @@ describe('Lifecycle handlers', () => {
   it('run_project supports waitForReady with a cheap probe round-trip', () => {
     expect(sourceCode).toContain('waitForReady');
     expect(sourceCode).toContain("args.waitForReady === true");
-    expect(sourceCode).toContain("this.sendGameCommand('get_performance', {}, 8000)");
+    expect(sourceCode).toContain("this.sendGameCommand(rec, 'get_performance', {}, 8000)");
     expect(sourceCode).toContain('probeOk');
   });
 
   it('connectToGame reports success as a boolean', () => {
-    expect(sourceCode).toContain('private async connectToGame(projectPath: string): Promise<boolean>');
+    // The record carries the port and the project path, so the boot-time
+    // connect loop takes the record and nothing else.
+    expect(sourceCode).toContain('private async connectToGame(rec: GameRecord): Promise<boolean>');
   });
 
   it('handleStopProject exists and kills process', () => {
     expect(sourceCode).toContain('handleStopProject');
     // Should have some form of process termination
-    expect(sourceCode).toContain('activeProcess');
+    expect(sourceCode).toContain('proc.kill();');
   });
 
   it('handleGetDebugOutput exists and reads output buffer', () => {
@@ -1168,6 +1186,8 @@ describe('Game response correlation', () => {
     );
 
   it('tracks in-flight requests in an id-keyed map, not a single resolver', () => {
+    // The map lives on the GameRecord, so one game's in-flight requests can
+    // never be answered — or drained — by another game's socket.
     expect(sourceCode).toContain('pendingRequests: Map<number, PendingGameRequest>');
     expect(sourceCode).toContain('pendingRequests: new Map()');
     expect(sourceCode).not.toContain('pendingResolve');
@@ -1176,25 +1196,28 @@ describe('Game response correlation', () => {
   it('pending entries carry the resolver, its timer and the command name', () => {
     const iface = sourceCode.substring(
       sourceCode.indexOf('interface PendingGameRequest {'),
-      sourceCode.indexOf('interface GameConnection {')
+      sourceCode.indexOf('class GodotServer {')
     );
     expect(iface).toContain('resolve: (value: any) => void;');
     expect(iface).toContain('timer: ReturnType<typeof setTimeout>;');
     expect(iface).toContain('command: string;');
   });
 
-  it('stamps a monotonic request id starting at 1 on every command', () => {
-    expect(sourceCode).toContain('private nextRequestId: number = 1;');
-    expect(sendBlock()).toContain('const id = this.nextRequestId++;');
+  it('stamps a monotonic per-record request id starting at 1 on every command', () => {
+    // Ids are per-game: two games each counting from 1 is fine, because a
+    // response is only ever matched against the record it arrived on.
+    expect(sourceCode).toContain('nextRequestId: number;');
+    expect(sourceCode).toContain('nextRequestId: 1,');
+    expect(sendBlock()).toContain('const id = rec.nextRequestId++;');
     expect(sendBlock()).toContain("JSON.stringify({ id, command, params }) + '\\n'");
   });
 
   it('registers the waiter in the pending map keyed by that id', () => {
-    expect(sendBlock()).toContain('this.gameConnection.pendingRequests.set(id, {');
+    expect(sendBlock()).toContain('rec.pendingRequests.set(id, {');
   });
 
   it('timeout deletes the entry and names command + duration', () => {
-    expect(sendBlock()).toContain('this.gameConnection.pendingRequests.delete(id);');
+    expect(sendBlock()).toContain('rec.pendingRequests.delete(id);');
     expect(sendBlock()).toContain(
       "reject(new Error(`Game command '${command}' timed out after ${timeoutMs / 1000}s`));"
     );
@@ -1202,16 +1225,18 @@ describe('Game response correlation', () => {
 
   it('defaults to a 12s timeout so the game\'s own busy error wins the race', () => {
     expect(sourceCode).toContain(
-      'private async sendGameCommand(command: string, params: Record<string, any> = {}, timeoutMs: number = 12000)'
+      'private async sendGameCommand(rec: GameRecord, command: string, params: Record<string, any> = {}, timeoutMs: number = 12000)'
     );
   });
 
   it('keeps the long per-command overrides untouched', () => {
     expect(sourceCode).toContain("this.gameCommand('eval', args, a => ({ code: a.code }), 30000);");
-    expect(sourceCode).toContain("this.sendGameCommand('get_performance', {}, 8000)");
+    expect(sourceCode).toContain("this.sendGameCommand(rec, 'get_performance', {}, 8000)");
   });
 
   it('resolves a response whose id matches a pending request', () => {
+    expect(sourceCode).toContain('private resolveGameResponse(rec: GameRecord, parsed: any): void {');
+    expect(dispatchBlock()).toContain('const pending = rec.pendingRequests;');
     expect(dispatchBlock()).toContain("typeof parsed.id === 'number'");
     expect(dispatchBlock()).toContain('const matched = pending.get(parsed.id);');
     expect(dispatchBlock()).toContain('pending.delete(parsed.id);');
@@ -1242,15 +1267,17 @@ describe('Game response correlation', () => {
   });
 
   it('drains every pending request on close and on disconnect', () => {
-    expect(sourceCode).toContain('private resolveAllPending(response: any): void {');
+    // Scoped to one record: a drain triggered by one game's socket closing
+    // must not answer another game's waiters with 'Connection closed'.
+    expect(sourceCode).toContain('private resolveAllPending(rec: GameRecord, response: any): void {');
     expect(sourceCode).toContain('clearTimeout(pending.timer);');
-    expect(sourceCode).toContain('this.gameConnection.pendingRequests.clear();');
-    expect(sourceCode).toContain("this.resolveAllPending({ error: 'Connection closed' });");
-    expect(sourceCode).toContain("this.resolveAllPending({ error: 'Disconnected' });");
+    expect(sourceCode).toContain('rec.pendingRequests.clear();');
+    expect(sourceCode).toContain("this.resolveAllPending(rec, { error: 'Connection closed' });");
+    expect(sourceCode).toContain("this.resolveAllPending(rec, { error: 'Disconnected' });");
   });
 
   it('receive path hands every parsed line to the correlator', () => {
-    expect(sourceCode).toContain('this.resolveGameResponse(parsed);');
+    expect(sourceCode).toContain('this.resolveGameResponse(rec, parsed);');
   });
 });
 
@@ -1281,8 +1308,139 @@ describe('GODOT_MCP_DISABLE on short-lived Godot spawns', () => {
       sourceCode.indexOf('const spawnEnv = {'),
       sourceCode.indexOf('const cmdArgs = args.debug === false')
     );
-    expect(block).toContain('GODOT_MCP_PORT: String(this.interactionPort)');
+    // Each game is told its own allocated port, which is what lets several
+    // games run at once without hand-editing any project config.
+    expect(block).toContain('GODOT_MCP_PORT: String(rec.port)');
     expect(block).not.toContain('GODOT_MCP_DISABLE');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 7a3. Multi-game registry: port window, allocation, injection refcounting,
+//      record lifecycle and per-record buffers.
+//
+// These pin the structure that keeps N tracked games from corrupting each
+// other. Every assertion below is a substring copied verbatim from src, so a
+// refactor that quietly re-couples two games to one field fails here.
+// ---------------------------------------------------------------------------
+describe('Multi-game registry', () => {
+  const blockBetween = (start: string, end: string) =>
+    sourceCode.substring(sourceCode.indexOf(start), sourceCode.indexOf(end));
+
+  it('parses GODOT_MCP_PORT_RANGE as a lo-hi window, rejecting malformed values', () => {
+    expect(sourceCode).toContain('const rawRange = process.env.GODOT_MCP_PORT_RANGE;');
+    expect(sourceCode).toContain('const m = /^(\\d+)-(\\d+)$/.exec(rawRange.trim());');
+    expect(sourceCode).toContain('if (m && lo >= 1 && lo <= hi && hi <= 65535) {');
+    // A width-1 GODOT_MCP_PORT pin still wins, and still says so in the old
+    // words — a legacy slot must behave exactly as it did before.
+    expect(sourceCode).toContain(
+      '`[SERVER] GODOT_MCP_PORT=${parsed} set explicitly, will not auto-pick`'
+    );
+    expect(sourceCode).toContain('this.legacyPinned = true;');
+  });
+
+  it('allocatePort skips ports already reserved by live records', () => {
+    // The bridge knows about its own games, so it never has to lose the
+    // probe race to itself; `excludePortsOf` lets a replacement ignore the
+    // record it is about to kill.
+    expect(sourceCode).toContain(
+      'private async allocatePort(excludePortsOf?: GameRecord): Promise<number | null> {'
+    );
+    const alloc = blockBetween('private async allocatePort(', 'private disconnectFromGame(');
+    expect(alloc).toContain('const reserved = new Set<number>();');
+    expect(alloc).toContain('for (const g of this.games.values()) {');
+    expect(alloc).toContain("if (g.status !== 'exited' && g !== excludePortsOf) reserved.add(g.port);");
+    expect(alloc).toContain('if (reserved.has(port)) continue;');
+    expect(alloc).toContain('if (await this.isPortFree(port)) return port;');
+  });
+
+  it('the exit handler retires the record through markExited', () => {
+    expect(sourceCode).toContain('this.markExited(rec, code);');
+    expect(sourceCode).toContain('this.markExited(rec, null);');
+  });
+
+  it("markExited flips status to 'exited'; legacy pinned mode deletes the record", () => {
+    const markExited = blockBetween('private markExited(', 'private attemptGameConnection(');
+    // Registry identity is the analogue of the old activeProcess check: a
+    // record a replacement already unpublished must not touch its successor.
+    expect(markExited).toContain('if (this.games.get(rec.name) !== rec) return;');
+    expect(markExited).toContain("rec.status = 'exited';");
+    expect(markExited).toContain('rec.exitCode = code;');
+    expect(markExited).toContain('rec.process = null;');
+    expect(markExited).toContain('this.disconnectFromGame(rec);');
+    expect(markExited).toContain('this.releaseInjectionFor(rec);');
+    // Legacy mode frees the slot the instant the game dies (external probers
+    // match on that); ranged mode keeps the corpse for forensics.
+    expect(markExited).toContain('if (this.legacyPinned) {');
+    expect(markExited).toContain('this.games.delete(rec.name);');
+    expect(markExited).toContain('this.evictExitedRecords();');
+  });
+
+  it('injection is refcounted per project and released idempotently per record', () => {
+    expect(sourceCode).toContain('private acquireInjection(projectPath: string): void {');
+    expect(sourceCode).toContain('private releaseInjectionFor(rec: GameRecord): void {');
+    const acquire = blockBetween('private acquireInjection(', 'private releaseInjectionFor(');
+    expect(acquire).toContain('const refs = this.injectionRefs.get(key) ?? 0;');
+    expect(acquire).toContain('if (refs === 0) this.injectInteractionServer(projectPath);');
+    const release = blockBetween('private releaseInjectionFor(', 'private liveNames(');
+    // stop_project and the child's own exit handler both release; only the
+    // first call may decrement, or two games sharing a project strip each
+    // other's autoload.
+    expect(release).toContain('if (rec.injectionReleased) return;');
+    expect(release).toContain('rec.injectionReleased = true;');
+    expect(release).toContain('this.removeInteractionServer(rec.projectPath);');
+  });
+
+  it('stop_project escalates a bounced SIGTERM to SIGKILL inside try/catch', () => {
+    const stop = blockBetween('private async handleStopProject(', 'private async handleListGames(');
+    expect(stop).toContain('proc.kill();');
+    expect(stop).toContain("proc.kill('SIGKILL');");
+    // kill() can throw on an already-dead handle on Windows, so the
+    // escalation must not be able to abort the record cleanup below it.
+    const killIdx = stop.indexOf("proc.kill('SIGKILL');");
+    const tryIdx = stop.lastIndexOf('try {', killIdx);
+    const catchIdx = stop.indexOf('} catch (err) {', killIdx);
+    expect(tryIdx).toBeGreaterThan(-1);
+    expect(catchIdx).toBeGreaterThan(killIdx);
+    expect(stop).toContain('escalated = true;');
+  });
+
+  it('evictExitedRecords caps retained corpses at MAX_EXITED_RECORDS', () => {
+    expect(sourceCode).toContain('private static readonly MAX_EXITED_RECORDS = 8;');
+    const evict = blockBetween('private evictExitedRecords(): void {', 'private markExited(');
+    expect(evict).toContain("const exited = [...this.games.values()].filter(g => g.status === 'exited');");
+    expect(evict).toContain('if (exited.length <= GodotServer.MAX_EXITED_RECORDS) return;');
+    // Oldest death goes first.
+    expect(evict).toContain('exited.sort((a, b) => (a.exitedAt ?? 0) - (b.exitedAt ?? 0));');
+    expect(evict).toContain(
+      'for (const stale of exited.slice(0, exited.length - GodotServer.MAX_EXITED_RECORDS)) {'
+    );
+    expect(evict).toContain('this.games.delete(stale.name);');
+  });
+
+  it('buffer trimming is record-scoped, never re-read off the server', () => {
+    // A dying process's late stdout must trim its OWN buffer and rebase its
+    // OWN cursors — re-reading "the current game" here is exactly how a stale
+    // handler used to corrupt the successor's read cursors.
+    expect(sourceCode).toContain("private trimBuffer(rec: GameRecord, stream: 'output' | 'errors'): void {");
+    expect(sourceCode).toContain('private appendOutputLines(rec: GameRecord, lines: string[]): void {');
+    expect(sourceCode).toContain('private appendErrorLines(rec: GameRecord, lines: string[]): void {');
+    expect(sourceCode).toContain("this.trimBuffer(rec, 'output');");
+    expect(sourceCode).toContain("this.trimBuffer(rec, 'errors');");
+    const appendAndTrim = blockBetween('private appendOutputLines(', 'private async handleGetDebugOutput(');
+    expect(appendAndTrim).toContain('rec.lastLogIndex = Math.max(0, rec.lastLogIndex - overflow);');
+    expect(appendAndTrim).toContain('rec.lastErrorIndex = Math.max(0, rec.lastErrorIndex - overflow);');
+    expect(appendAndTrim).not.toContain('this.activeProcess');
+    expect(appendAndTrim).not.toContain('this.gameConnection');
+  });
+
+  it('keeps the legacy empty-registry wording byte-for-byte', () => {
+    // External probers and skills match these exact bytes to decide whether a
+    // slot is free. resolveGame echoes the caller's own string, so each call
+    // site owns its legacy wording.
+    expect(sourceCode).toContain("this.resolveGame(args, 'No active Godot process.');");
+    expect(sourceCode).toContain("this.resolveGame(args, 'No active Godot process to stop.');");
+    expect(sourceCode).toContain("this.resolveGame(args, 'No active Godot process. Use run_project first.');");
   });
 });
 
@@ -2221,7 +2379,7 @@ describe('Tool dispatch switch statement', () => {
     const caseRegex = /case '(\w+)':\s*\n\s*return await this\.handle/g;
     const matches = [...sourceCode.matchAll(caseRegex)];
     // Should match all dispatched tools (bump when adding/removing a case).
-    expect(matches.length).toBe(167);
+    expect(matches.length).toBe(169);
   });
 
   it('no case falls through without return', () => {
