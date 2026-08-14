@@ -3623,6 +3623,7 @@ class GodotServer {
               seat: { type: 'integer', description: 'Player seat: 0 or 1.' },
               includeCandidates: { type: 'boolean', description: 'Include AI-enumerated candidate plans (default true).' },
               candidateCap: { type: 'integer', description: 'Max candidate plans returned (default 10).' },
+              fairPlay: { type: 'boolean', description: "Withhold the OPPONENT's queued plan (command_queue + queued_commands). Default false. Use when playing a seat; leave false when debugging a desync." },
             },
             required: ['seat'],
           },
@@ -3636,6 +3637,21 @@ class GodotServer {
               seat: { type: 'integer', description: 'Player seat: 0 or 1.' },
               commands: { type: 'array', items: { type: 'object' }, description: 'Command dicts: type, card_runtime_ID, play_location, card_ID.' },
               externalControl: { type: 'boolean', description: 'Set or clear AI-seat takeover. Omit to leave unchanged.' },
+              dropDrawCommands: { type: 'boolean', description: 'Strip DRAW_CARD/DRAW_CARD_FREE from the batch instead of refusing it (count comes back as dropped_draws). Draw with spirits_draw_card instead. Default false.' },
+            },
+            required: ['seat'],
+          },
+        },
+        // A deck draw is a multi-frame client gesture, not a queueable command,
+        // so spirits_submit_command refuses draws. This drives the real
+        // request_draw -> draw_complete wire round trip and waits for the verdict.
+        {
+          name: 'spirits_draw_card',
+          description: 'Spirits: Unbound — draw one card for a seat via the real deck-drag wire gesture.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              seat: { type: 'integer', description: 'Player seat: 0 or 1.' },
             },
             required: ['seat'],
           },
@@ -3758,6 +3774,8 @@ class GodotServer {
           return await this.handleSpiritsObserve(request.params.arguments);
         case 'spirits_submit_command':
           return await this.handleSpiritsSubmitCommand(request.params.arguments);
+        case 'spirits_draw_card':
+          return await this.handleSpiritsDrawCard(request.params.arguments);
         case 'spirits_forced_swap':
           return await this.handleSpiritsForcedSwap(request.params.arguments);
         case 'spirits_session_dump':
@@ -5333,7 +5351,8 @@ class GodotServer {
   // Dispatched server-side in C:/GodotGames/deckbuilder/scripts/mcp_interaction_server.gd
   // (commands: spirits_state_probe / spirits_suspend_snapshot / spirits_boot_match /
   // spirits_inspect_card / spirits_observe / spirits_submit_command /
-  // spirits_forced_swap / spirits_session_dump / spirits_last_round), implemented
+  // spirits_draw_card / spirits_forced_swap / spirits_session_dump /
+  // spirits_last_round), implemented
   // in scripts/spirits_mcp_helpers.gd. These are
   // first-class MCP tools rather than game_eval wrappers so agents get autocomplete
   // and schema validation; they no-op cleanly when no game is running.
@@ -5372,6 +5391,7 @@ class GodotServer {
       seat: a.seat ?? 0,
       include_candidates: a.includeCandidates ?? true,
       candidate_cap: a.candidateCap ?? 10,
+      fair_play: a.fairPlay ?? false,
     }), 30000);
   }
 
@@ -5380,8 +5400,19 @@ class GodotServer {
       const out: Record<string, any> = { seat: a.seat ?? 0 };
       if (a.commands !== undefined) out.commands = a.commands;
       if (a.externalControl !== undefined) out.external_control = a.externalControl;
+      if (a.dropDrawCommands !== undefined) out.drop_draw_commands = a.dropDrawCommands;
       return out;
     });
+  }
+
+  // Game-side budget is 4s of wall clock (DRAW_WAIT_MS) for the request_draw →
+  // draw_complete round trip plus the card-flip tween. 15s leaves generous room
+  // above that, so a bridge timeout means the GAME is wedged — never that the
+  // draw simply took a while.
+  private async handleSpiritsDrawCard(args: any) {
+    return this.gameCommand('spirits_draw_card', args, a => ({
+      seat: a.seat ?? 0,
+    }), 15000);
   }
 
   private async handleSpiritsForcedSwap(args: any) {
