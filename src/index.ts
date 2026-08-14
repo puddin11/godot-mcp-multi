@@ -13,6 +13,7 @@ import { existsSync, readdirSync, readFileSync, writeFileSync, copyFileSync, unl
 import { spawn, execFile } from 'child_process';
 import { promisify } from 'util';
 import { createConnection, createServer, Socket } from 'net';
+import { randomBytes } from 'crypto';
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
@@ -68,10 +69,33 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
 /**
- * Interface representing a running Godot process
+ * Where a tracked game is in its life. 'starting' spans spawn until the
+ * interaction socket is wired in; 'exited' records are kept for forensics
+ * (buffers, exit code) until they age out — see MAX_EXITED_RECORDS.
  */
-interface GodotProcess {
-  process: any;
+type GameStatus = 'starting' | 'running' | 'exited';
+
+/**
+ * Everything the bridge knows about one named Godot game: the child process
+ * and its bounded output buffers, the interaction socket and its in-flight
+ * requests, and the per-consumer read cursors.
+ *
+ * One record per name in `games`; nothing about a game lives on the server
+ * object any more, so two games can never share a buffer, a request id, a
+ * cursor or a socket.
+ */
+interface GameRecord {
+  name: string;
+  status: GameStatus;
+  projectPath: string;
+  port: number;
+
+  // --- process side ---
+  process: any | null; // nulled on exit; pid survives for forensics
+  pid: number | null;
+  exitCode: number | null;
+  startedAt: number;
+  exitedAt: number | null;
   output: string[];
   errors: string[];
   droppedOutput: number; // lines evicted from the front of output[] (ring-buffer overflow)
@@ -83,6 +107,30 @@ interface GodotProcess {
   // so only the bridge can answer "did this build stall at all tonight?".
   watchdogHits: number;
   portResolved: boolean; // once we learn the bound port, stop regex-scanning every stdout line
+
+  // --- connection side ---
+  socket: Socket | null;
+  connected: boolean;
+  responseBuffer: string;
+  // Request-id -> waiter. Insertion-ordered, which is what makes the id-less
+  // FIFO fallback in resolveGameResponse() well defined. Per-record, so that
+  // fallback can only ever cross-talk within one game.
+  pendingRequests: Map<number, PendingGameRequest>;
+  // Monotonic request id stamped on every outbound game command. Starts at 1
+  // and only ever increases: the game reads a missing or negative id as
+  // "id-less request" and answers without an id, so 0/-1 must never be issued.
+  nextRequestId: number;
+  // In-flight lazy connect, so concurrent callers coalesce onto one attempt.
+  lazyConnectPromise: Promise<boolean> | null;
+
+  // --- consumer cursors (game_get_logs / game_get_errors) ---
+  lastErrorIndex: number;
+  lastLogIndex: number;
+
+  // --- lifecycle guards ---
+  // Makes un-injection idempotent: stop_project and the child's own exit
+  // handler both release, and only the first call may decrement the refcount.
+  injectionReleased: boolean;
 }
 
 // Cap each in-memory stdout/stderr ring buffer. At 16x with a noisy game these
@@ -112,55 +160,46 @@ interface PendingGameRequest {
 }
 
 /**
- * Interface for a TCP connection to the running game
- */
-interface GameConnection {
-  socket: Socket | null;
-  connected: boolean;
-  responseBuffer: string;
-  // Request-id -> waiter. Insertion-ordered, which is what makes the id-less
-  // FIFO fallback in resolveGameResponse() well defined.
-  pendingRequests: Map<number, PendingGameRequest>;
-  projectPath: string | null;
-}
-
-/**
  * Main server class for the Godot MCP server
  */
 class GodotServer {
   private server: Server;
-  private activeProcess: GodotProcess | null = null;
   private godotPath: string | null = null;
   private operationsScriptPath: string;
   private interactionScriptPath: string;
   private validateScriptPath: string;
   private validatedPaths: Map<string, boolean> = new Map();
   private strictPathValidation: boolean = false;
-  private gameConnection: GameConnection = {
-    socket: null,
-    connected: false,
-    responseBuffer: '',
-    pendingRequests: new Map(),
-    projectPath: null,
-  };
-  // Monotonic request id stamped on every outbound game command. Starts at 1
-  // and only ever increases: the game reads a missing or negative id as
-  // "id-less request" and answers without an id, so 0/-1 must never be issued.
-  private nextRequestId: number = 1;
-  private lastErrorIndex: number = 0;
-  private lastLogIndex: number = 0;
-  // Port for talking to the game's interaction server.
-  // Resolution order at run_project time:
-  //   1. GODOT_MCP_PORT env var set on the godot-mcp process — used verbatim, no auto-pick.
-  //   2. Otherwise auto-pick a free port in BASE_PORT..BASE_PORT+PORT_SCAN_RANGE-1,
-  //      inject GODOT_MCP_PORT into the spawned Godot process's environment.
-  // This lets multiple Claude sessions each get an isolated Godot game instance
-  // without manual per-session port configuration. The bundled autoload picks
-  // the same env var; if the autoload's auto-scan picks a different port
-  // (e.g. due to a race), we parse the "Listening on 127.0.0.1:NNNN" log line
-  // and update interactionPort to match.
-  private static readonly BASE_PORT = 9090;
-  private static readonly PORT_SCAN_RANGE = 10;
+  // Every tracked game, keyed by name. Insertion-ordered, so "the sole record"
+  // (the omitted-`game` shorthand) and the eviction scan are both well defined.
+  private games: Map<string, GameRecord> = new Map();
+  // normalize(projectPath).toLowerCase() -> how many live records are injected
+  // into it. The autoload goes in on the 0->1 transition and comes out on
+  // 1->0, so two games sharing one project can't strip each other's injection.
+  private injectionRefs: Map<string, number> = new Map();
+  // Serializes "pick a port, publish the record" so two interleaved
+  // run_projects can't double-book a port between the probe and the insert.
+  private allocLock: Promise<unknown> = Promise.resolve();
+  // Port window for the games' interaction servers. Resolved once, at
+  // construction time:
+  //   1. GODOT_MCP_PORT env var set on the godot-mcp process — a legacy
+  //      single-slot pin: the window is that one port, used verbatim and never
+  //      probed, and the server keeps the old one-game-at-a-time semantics.
+  //   2. GODOT_MCP_PORT_RANGE="lo-hi" — allocate anywhere inside that window.
+  //   3. Otherwise 9110-9159, clear of the legacy per-slot pins (9090-9092)
+  //      and the loopback-lab pins (9097-9099).
+  // Each spawned game gets its allocated port injected as GODOT_MCP_PORT in
+  // its own environment, so the bundled autoload binds the matching port. If
+  // the autoload still lands elsewhere (e.g. a race), we parse the
+  // "Listening on 127.0.0.1:NNNN" log line and update that record's port.
+  private static readonly DEFAULT_PORT_LO = 9110;
+  private static readonly DEFAULT_PORT_HI = 9159;
+  // How many dead games to keep around for forensics before the ones that died
+  // longest ago are dropped. Legacy pinned mode keeps none — see markExited().
+  private static readonly MAX_EXITED_RECORDS = 8;
+  // What a `game` name may look like. Names appear in log lines, profile
+  // directory names and error text, so keep them boring.
+  private static readonly GAME_NAME_RE = /^[A-Za-z0-9_-]{1,64}$/;
   // How long connectToGame keeps retrying after spawn before giving up, and
   // the pause between attempts. The game's interaction autoload binds its
   // port only after everything ahead of it in the boot sequence finishes
@@ -171,29 +210,45 @@ class GodotServer {
   // early instead of running out the deadline.
   private static readonly CONNECT_DEADLINE_MS = 30000;
   private static readonly CONNECT_RETRY_MS = 500;
-  private interactionPort: number;
-  private interactionPortLocked: boolean;
+  private portLo: number;
+  private portHi: number;
+  private legacyPinned: boolean;
   private readonly AUTOLOAD_NAME = 'McpInteractionServer';
 
   constructor(config?: GodotServerConfig) {
-    // Resolve interaction-server port. Explicit GODOT_MCP_PORT env var locks
-    // the port (no auto-pick at run_project time); absence falls through to
-    // auto-pick. See INTERACTION_PORT comment for full priority order.
+    // Resolve the interaction-port window. An explicit GODOT_MCP_PORT pins a
+    // width-1 window and puts the server in legacy single-slot mode (never
+    // probed, no exited-record retention); GODOT_MCP_PORT_RANGE widens it;
+    // absence falls through to the default range. See the field comment above
+    // for the full priority order.
+    this.portLo = GodotServer.DEFAULT_PORT_LO;
+    this.portHi = GodotServer.DEFAULT_PORT_HI;
+    this.legacyPinned = false;
+
     const rawPort = process.env.GODOT_MCP_PORT;
     if (rawPort) {
       const parsed = parseInt(rawPort, 10);
       if (!Number.isNaN(parsed) && parsed >= 1 && parsed <= 65535) {
-        this.interactionPort = parsed;
-        this.interactionPortLocked = true;
+        this.portLo = parsed;
+        this.portHi = parsed;
+        this.legacyPinned = true;
         console.error(`[SERVER] GODOT_MCP_PORT=${parsed} set explicitly, will not auto-pick`);
       } else {
         console.error(`[SERVER] GODOT_MCP_PORT='${rawPort}' is not a valid port (1-65535), falling back to auto-pick`);
-        this.interactionPort = GodotServer.BASE_PORT;
-        this.interactionPortLocked = false;
       }
-    } else {
-      this.interactionPort = GodotServer.BASE_PORT;
-      this.interactionPortLocked = false;
+    }
+
+    const rawRange = process.env.GODOT_MCP_PORT_RANGE;
+    if (!this.legacyPinned && rawRange) {
+      const m = /^(\d+)-(\d+)$/.exec(rawRange.trim());
+      const lo = m ? parseInt(m[1], 10) : NaN;
+      const hi = m ? parseInt(m[2], 10) : NaN;
+      if (m && lo >= 1 && lo <= hi && hi <= 65535) {
+        this.portLo = lo;
+        this.portHi = hi;
+      } else {
+        console.error(`[SERVER] GODOT_MCP_PORT_RANGE='${rawRange}' is not a valid 'lo-hi' range, falling back to ${this.portLo}-${this.portHi}`);
+      }
     }
 
     // Apply configuration if provided
@@ -504,48 +559,173 @@ class GodotServer {
     }
   }
 
+  /** Refcount key for a project: normalized and case-folded, this being Windows. */
+  private injectionKey(projectPath: string): string {
+    return normalize(projectPath).toLowerCase();
+  }
+
   /**
-   * One TCP connect attempt against the game's interaction server. On success
-   * the socket is wired into gameConnection (data/close/error handlers
-   * attached) and the promise resolves; on failure it rejects. Shared by the
-   * boot-time retry loop (connectToGame) and the lazy on-demand path
+   * Take a reference on this project's injected autoload, injecting on the
+   * 0->1 transition. Two games running the same project share one injection.
+   */
+  private acquireInjection(projectPath: string): void {
+    const key = this.injectionKey(projectPath);
+    const refs = this.injectionRefs.get(key) ?? 0;
+    this.injectionRefs.set(key, refs + 1);
+    if (refs === 0) this.injectInteractionServer(projectPath);
+  }
+
+  /**
+   * Drop this record's reference, stripping the autoload on the 1->0
+   * transition. Idempotent per record: stop_project and the child's own exit
+   * handler both release, and only the first call may decrement.
+   */
+  private releaseInjectionFor(rec: GameRecord): void {
+    if (rec.injectionReleased) return;
+    rec.injectionReleased = true;
+    const key = this.injectionKey(rec.projectPath);
+    const refs = this.injectionRefs.get(key) ?? 0;
+    if (refs <= 1) {
+      this.injectionRefs.delete(key);
+      this.removeInteractionServer(rec.projectPath);
+    } else {
+      this.injectionRefs.set(key, refs - 1);
+    }
+  }
+
+  /** Names of every record that has not exited, in creation order. */
+  private liveNames(): string[] {
+    return [...this.games.values()].filter(g => g.status !== 'exited').map(g => g.name);
+  }
+
+  /**
+   * Resolve the `game` selector on a tool call to a record.
+   *
+   * Read straight off the raw args, BEFORE normalizeParameters: `game` has no
+   * underscore so normalization would leave it alone anyway, and resolving
+   * first keeps the selector out of every argsFn closure.
+   *
+   * Omitting `game` is the single-game shorthand every existing caller relies
+   * on — it resolves only while exactly one game is tracked. With none, the
+   * caller's own legacy "no active Godot process" wording comes back verbatim
+   * (external probers match those bytes); with several, the caller is told to
+   * name one rather than being handed an arbitrary game.
+   */
+  private resolveGame(args: any, emptyError: string): { rec?: GameRecord; err?: string } {
+    const name = typeof args?.game === 'string' ? args.game.trim() : '';
+    if (name) {
+      const rec = this.games.get(name);
+      if (!rec) {
+        return { err: `Unknown game '${name}'. Live games: ${this.liveNames().join(', ') || 'none'}. Use list_games.` };
+      }
+      return { rec };
+    }
+    if (this.games.size === 0) return { err: emptyError };
+    if (this.games.size === 1) return { rec: this.games.values().next().value };
+    return { err: `Multiple games exist; pass the 'game' parameter. Live games: ${this.liveNames().join(', ') || 'none'}. Use list_games.` };
+  }
+
+  /**
+   * What a socket tool says when it resolved a corpse. The buffers outlive the
+   * process on purpose, so point the caller at the two tools that still work.
+   */
+  private exitedGameError(rec: GameRecord): string {
+    return `Game '${rec.name}' has exited (code ${rec.exitCode}). Buffers retained; use get_debug_output or stop_project.`;
+  }
+
+  /** A short unique name for a run_project that didn't pick one. */
+  private mintGameName(): string {
+    let name = 'game-' + randomBytes(4).toString('hex');
+    while (this.games.has(name)) name = 'game-' + randomBytes(4).toString('hex');
+    return name;
+  }
+
+  /**
+   * Keep at most MAX_EXITED_RECORDS corpses, dropping the ones that died
+   * longest ago. Exited records exist for forensics (retained buffers, exit
+   * code) and would otherwise accumulate for the life of the server.
+   */
+  private evictExitedRecords(): void {
+    const exited = [...this.games.values()].filter(g => g.status === 'exited');
+    if (exited.length <= GodotServer.MAX_EXITED_RECORDS) return;
+    exited.sort((a, b) => (a.exitedAt ?? 0) - (b.exitedAt ?? 0));
+    for (const stale of exited.slice(0, exited.length - GodotServer.MAX_EXITED_RECORDS)) {
+      this.games.delete(stale.name);
+    }
+  }
+
+  /**
+   * Retire a record whose child process is gone: flip it to 'exited', tear the
+   * socket down, drop its injection reference.
+   *
+   * Guarded by registry identity — the analogue of the old
+   * `activeProcess.process === process` check. A record that a replacement
+   * run_project already unpublished keeps its own (now unreferenced) buffers
+   * and can neither disconnect the successor's socket nor strip its fresh
+   * injection.
+   */
+  private markExited(rec: GameRecord, code: number | null): void {
+    if (this.games.get(rec.name) !== rec) return;
+    rec.status = 'exited';
+    rec.exitCode = code;
+    rec.exitedAt = Date.now();
+    rec.process = null;
+    this.disconnectFromGame(rec);
+    this.releaseInjectionFor(rec);
+    if (this.legacyPinned) {
+      // Legacy single-slot mode keeps today's semantics exactly: the slot
+      // reads as free the moment the game dies, which is what external
+      // probers match on ("No active Godot process."). Retaining corpses is
+      // a ranged-mode feature.
+      this.games.delete(rec.name);
+    } else {
+      this.evictExitedRecords();
+    }
+  }
+
+  /**
+   * One TCP connect attempt against one game's interaction server. On success
+   * the socket is wired into that record (data/close/error handlers attached)
+   * and the promise resolves; on failure it rejects. Shared by the boot-time
+   * retry loop (connectToGame) and the lazy on-demand path
    * (ensureGameConnection).
    */
-  private attemptGameConnection(ap: GodotProcess): Promise<void> {
+  private attemptGameConnection(rec: GameRecord): Promise<void> {
     return new Promise<void>((resolve, reject) => {
-      const socket = createConnection({ host: '127.0.0.1', port: this.interactionPort }, () => {
-        // The slot may have been rebooted while this attempt was in flight —
-        // a socket to a stale process must not be wired in as current.
-        if (this.activeProcess !== ap) {
+      const socket = createConnection({ host: '127.0.0.1', port: rec.port }, () => {
+        // The game may have been replaced or died while this attempt was in
+        // flight — a socket to a stale process must not be wired in as current.
+        if (this.games.get(rec.name) !== rec || rec.status === 'exited') {
           socket.destroy();
-          reject(new Error('slot rebooted during connect'));
+          reject(new Error('game replaced during connect'));
           return;
         }
         // Another attempt (boot loop vs lazy path) may have won the race;
         // keep the established link and discard this one.
-        if (this.gameConnection.connected && this.gameConnection.socket && this.gameConnection.socket !== socket) {
+        if (rec.connected && rec.socket && rec.socket !== socket) {
           socket.destroy();
           resolve();
           return;
         }
-        this.gameConnection.socket = socket;
-        this.gameConnection.connected = true;
-        this.gameConnection.responseBuffer = '';
+        rec.socket = socket;
+        rec.connected = true;
+        rec.responseBuffer = '';
+        rec.status = 'running';
         // A fresh socket can never answer anything queued against the old
         // one; drain so the map starts empty and no timer outlives it.
-        this.resolveAllPending({ error: 'Connection closed' });
+        this.resolveAllPending(rec, { error: 'Connection closed' });
 
         socket.on('data', (data: Buffer) => {
-          this.gameConnection.responseBuffer += data.toString();
+          rec.responseBuffer += data.toString();
           // Process complete lines
-          while (this.gameConnection.responseBuffer.includes('\n')) {
-            const newlinePos = this.gameConnection.responseBuffer.indexOf('\n');
-            const line = this.gameConnection.responseBuffer.substring(0, newlinePos).trim();
-            this.gameConnection.responseBuffer = this.gameConnection.responseBuffer.substring(newlinePos + 1);
+          while (rec.responseBuffer.includes('\n')) {
+            const newlinePos = rec.responseBuffer.indexOf('\n');
+            const line = rec.responseBuffer.substring(0, newlinePos).trim();
+            rec.responseBuffer = rec.responseBuffer.substring(newlinePos + 1);
             if (line.length > 0) {
               try {
                 const parsed = JSON.parse(line);
-                this.resolveGameResponse(parsed);
+                this.resolveGameResponse(rec, parsed);
               } catch (e) {
                 this.logDebug(`Failed to parse game response: ${line}`);
               }
@@ -554,10 +734,10 @@ class GodotServer {
         });
 
         socket.on('close', () => {
-          this.logDebug('Game interaction connection closed');
-          this.gameConnection.connected = false;
-          this.gameConnection.socket = null;
-          this.resolveAllPending({ error: 'Connection closed' });
+          this.logDebug(`Game '${rec.name}' interaction connection closed`);
+          rec.connected = false;
+          rec.socket = null;
+          this.resolveAllPending(rec, { error: 'Connection closed' });
         });
 
         socket.on('error', (err: Error) => {
@@ -579,24 +759,18 @@ class GodotServer {
    * disabled" / "no free port ..., MCP disabled this session" warnings. Lets
    * the connect loop fail fast instead of running out the full deadline.
    */
-  private mcpUnavailableForRun(ap: GodotProcess): boolean {
+  private mcpUnavailableForRun(rec: GameRecord): boolean {
     const marker = 'MCP disabled';
-    return ap.errors.some(line => line.includes(marker)) || ap.output.some(line => line.includes(marker));
+    return rec.errors.some(line => line.includes(marker)) || rec.output.some(line => line.includes(marker));
   }
 
   /**
-   * Connect to the game's TCP interaction server, retrying until the deadline.
+   * Connect to one game's TCP interaction server, retrying until the deadline.
    * Resolves true once the socket is up, false if the process died / was
    * replaced first, the game declared MCP unavailable, or the deadline passed
    * — callers (waitForReady) must be able to tell.
    */
-  private async connectToGame(projectPath: string): Promise<boolean> {
-    this.gameConnection.projectPath = projectPath;
-    const ap = this.activeProcess;
-    if (!ap) {
-      this.logDebug('No game process at connect start, aborting connection');
-      return false;
-    }
+  private async connectToGame(rec: GameRecord): Promise<boolean> {
     const deadline = Date.now() + GodotServer.CONNECT_DEADLINE_MS;
 
     // Initial delay to let the game start up
@@ -604,24 +778,24 @@ class GodotServer {
 
     let attempt = 0;
     while (true) {
-      if (this.activeProcess !== ap) {
-        this.logDebug('Game process no longer current, aborting connection');
+      if (this.games.get(rec.name) !== rec || rec.status === 'exited') {
+        this.logDebug(`Game '${rec.name}' no longer current, aborting connection`);
         return false;
       }
-      if (this.gameConnection.connected && this.gameConnection.socket) {
+      if (rec.connected && rec.socket) {
         // The lazy path connected while this loop slept.
         return true;
       }
-      if (this.mcpUnavailableForRun(ap)) {
+      if (this.mcpUnavailableForRun(rec)) {
         console.error('[SERVER] Game reports "MCP disabled" — interaction server will not come up this run, aborting connect.');
         return false;
       }
 
       attempt++;
       try {
-        await this.attemptGameConnection(ap);
+        await this.attemptGameConnection(rec);
         this.logDebug(`Connected to game interaction server (attempt ${attempt})`);
-        console.error(`[SERVER] Connected to game interaction server on port ${this.interactionPort} (attempt ${attempt})`);
+        console.error(`[SERVER] Connected to game '${rec.name}' interaction server on port ${rec.port} (attempt ${attempt})`);
         return true;
       } catch (err) {
         if (Date.now() >= deadline) break;
@@ -638,30 +812,27 @@ class GodotServer {
    * Ensure the interaction socket is up, attempting one immediate connect when
    * a live game exists but the link is down — a boot whose connect window was
    * missed, or a link that dropped while the game kept running. Concurrent
-   * callers coalesce onto one in-flight attempt. Returns whether the link is
-   * usable afterwards.
+   * callers coalesce onto one in-flight attempt (per record). Returns whether
+   * the link is usable afterwards.
    */
-  private lazyConnectPromise: Promise<boolean> | null = null;
-
-  private async ensureGameConnection(): Promise<boolean> {
-    if (this.gameConnection.connected && this.gameConnection.socket) return true;
-    const ap = this.activeProcess;
-    if (!ap) return false;
-    if (this.lazyConnectPromise) return this.lazyConnectPromise;
-    this.lazyConnectPromise = (async () => {
+  private async ensureGameConnection(rec: GameRecord): Promise<boolean> {
+    if (rec.connected && rec.socket) return true;
+    if (rec.status === 'exited') return false;
+    if (rec.lazyConnectPromise) return rec.lazyConnectPromise;
+    rec.lazyConnectPromise = (async () => {
       try {
-        if (this.gameConnection.connected && this.gameConnection.socket) return true;
-        await this.attemptGameConnection(ap);
-        console.error(`[SERVER] Late-connected to game interaction server on port ${this.interactionPort}`);
+        if (rec.connected && rec.socket) return true;
+        await this.attemptGameConnection(rec);
+        console.error(`[SERVER] Late-connected to game '${rec.name}' interaction server on port ${rec.port}`);
         return true;
       } catch (err) {
         this.logDebug(`Lazy connect attempt failed: ${err}`);
         return false;
       } finally {
-        this.lazyConnectPromise = null;
+        rec.lazyConnectPromise = null;
       }
     })();
-    return this.lazyConnectPromise;
+    return rec.lazyConnectPromise;
   }
 
   /**
@@ -680,40 +851,52 @@ class GodotServer {
   }
 
   /**
-   * Scan BASE_PORT..BASE_PORT+PORT_SCAN_RANGE-1 and return the first free port.
-   * Returns null if every port in range is busy.
+   * First free port in the configured window, skipping ports already reserved
+   * by live records — the bridge knows about its own games, so it never has to
+   * lose that race to itself. `excludePortsOf` lets a replacement ignore the
+   * record it is about to kill (whose port is about to be released, and which
+   * it deliberately does not inherit).
+   *
+   * Returns null when the whole window is taken. Callers run this inside
+   * allocLock, which is what closes the probe-then-insert TOCTOU.
    */
-  private async findFreePort(): Promise<number | null> {
-    for (let port = GodotServer.BASE_PORT; port < GodotServer.BASE_PORT + GodotServer.PORT_SCAN_RANGE; port++) {
+  private async allocatePort(excludePortsOf?: GameRecord): Promise<number | null> {
+    const reserved = new Set<number>();
+    for (const g of this.games.values()) {
+      if (g.status !== 'exited' && g !== excludePortsOf) reserved.add(g.port);
+    }
+    for (let port = this.portLo; port <= this.portHi; port++) {
+      if (reserved.has(port)) continue;
       if (await this.isPortFree(port)) return port;
     }
     return null;
   }
 
   /**
-   * Disconnect from the game interaction server
+   * Disconnect from one game's interaction server
    */
-  private disconnectFromGame(): void {
-    if (this.gameConnection.socket) {
-      this.gameConnection.socket.destroy();
-      this.gameConnection.socket = null;
+  private disconnectFromGame(rec: GameRecord): void {
+    if (rec.socket) {
+      rec.socket.destroy();
+      rec.socket = null;
     }
-    this.gameConnection.connected = false;
-    this.gameConnection.responseBuffer = '';
-    this.resolveAllPending({ error: 'Disconnected' });
+    rec.connected = false;
+    rec.responseBuffer = '';
+    this.resolveAllPending(rec, { error: 'Disconnected' });
   }
 
   /**
-   * Terminally answer every in-flight request (connection lost / torn down).
-   * Timers are cleared first so a drained request can never also reject on
-   * timeout afterwards.
+   * Terminally answer every in-flight request on one game (connection lost /
+   * torn down). Timers are cleared first so a drained request can never also
+   * reject on timeout afterwards. Per-record, so one game's disconnect can
+   * never drain another game's waiters.
    */
-  private resolveAllPending(response: any): void {
-    for (const pending of this.gameConnection.pendingRequests.values()) {
+  private resolveAllPending(rec: GameRecord, response: any): void {
+    for (const pending of rec.pendingRequests.values()) {
       clearTimeout(pending.timer);
       pending.resolve(response);
     }
-    this.gameConnection.pendingRequests.clear();
+    rec.pendingRequests.clear();
   }
 
   /**
@@ -730,10 +913,11 @@ class GodotServer {
    *    exactly the cross-talk the ids exist to prevent.
    *  - no id field at all -> FIFO fallback: resolve the oldest pending request.
    *    Keeps older game builds (which echo nothing) working, and covers the
-   *    game's rare id-less internal pushes.
+   *    game's rare id-less internal pushes. The map is per-record, so that
+   *    fallback can only ever cross-talk within one game.
    */
-  private resolveGameResponse(parsed: any): void {
-    const pending = this.gameConnection.pendingRequests;
+  private resolveGameResponse(rec: GameRecord, parsed: any): void {
+    const pending = rec.pendingRequests;
 
     if (parsed && typeof parsed.id === 'number') {
       const matched = pending.get(parsed.id);
@@ -767,22 +951,22 @@ class GodotServer {
    * and reach the caller instead of our generic local timeout. Per-command
    * overrides (game_eval, spirits_*) stay at their own longer values.
    */
-  private async sendGameCommand(command: string, params: Record<string, any> = {}, timeoutMs: number = 12000): Promise<any> {
-    if (!this.gameConnection.connected || !this.gameConnection.socket) {
+  private async sendGameCommand(rec: GameRecord, command: string, params: Record<string, any> = {}, timeoutMs: number = 12000): Promise<any> {
+    if (!rec.connected || !rec.socket) {
       throw new Error('Not connected to game interaction server. Is the game running?');
     }
 
-    const id = this.nextRequestId++;
+    const id = rec.nextRequestId++;
     const payload = JSON.stringify({ id, command, params }) + '\n';
 
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         // Drop the waiter: a late reply on this id is now stale by definition.
-        this.gameConnection.pendingRequests.delete(id);
+        rec.pendingRequests.delete(id);
         reject(new Error(`Game command '${command}' timed out after ${timeoutMs / 1000}s`));
       }, timeoutMs);
 
-      this.gameConnection.pendingRequests.set(id, {
+      rec.pendingRequests.set(id, {
         resolve: (response: any) => {
           clearTimeout(timer);
           resolve(response);
@@ -791,7 +975,7 @@ class GodotServer {
         command,
       });
 
-      this.gameConnection.socket!.write(payload);
+      rec.socket!.write(payload);
     });
   }
 
@@ -800,16 +984,31 @@ class GodotServer {
    */
   private async cleanup() {
     this.logDebug('Cleaning up resources');
-    this.disconnectFromGame();
-    if (this.gameConnection.projectPath) {
-      this.removeInteractionServer(this.gameConnection.projectPath);
-      this.gameConnection.projectPath = null;
+    // Remember each still-injected project by its as-spawned path: the
+    // refcount map is keyed by a case-folded path, which is fine to compare
+    // but not what we want to hand to the filesystem.
+    const injectedPaths = new Map<string, string>();
+    for (const rec of this.games.values()) {
+      this.disconnectFromGame(rec);
+      if (!rec.injectionReleased) {
+        injectedPaths.set(this.injectionKey(rec.projectPath), rec.projectPath);
+      }
+      if (rec.process) {
+        this.logDebug(`Killing Godot process for game '${rec.name}'`);
+        try {
+          rec.process.kill();
+        } catch (err) {
+          this.logDebug(`Kill of game '${rec.name}' failed: ${err}`);
+        }
+      }
     }
-    if (this.activeProcess) {
-      this.logDebug('Killing active Godot process');
-      this.activeProcess.process.kill();
-      this.activeProcess = null;
+    // One un-injection per project we still hold a reference on, however many
+    // games were sharing it.
+    for (const key of [...this.injectionRefs.keys()]) {
+      this.removeInteractionServer(injectedPaths.get(key) ?? key);
     }
+    this.games.clear();
+    this.injectionRefs.clear();
     await this.server.close();
   }
 
@@ -819,11 +1018,14 @@ class GodotServer {
     argsFn: (a: any) => Record<string, any>,
     timeoutMs?: number
   ): Promise<any> {
-    if (!this.activeProcess) return createErrorResponse('No active Godot process. Use run_project first.');
-    if (!(await this.ensureGameConnection())) return createErrorResponse('Not connected to game interaction server.');
+    const resolved = this.resolveGame(args, 'No active Godot process. Use run_project first.');
+    if (resolved.err) return createErrorResponse(resolved.err);
+    const rec = resolved.rec!;
+    if (rec.status === 'exited') return createErrorResponse(this.exitedGameError(rec));
+    if (!(await this.ensureGameConnection(rec))) return createErrorResponse('Not connected to game interaction server.');
     args = normalizeParameters(args || {});
     try {
-      const response = await this.sendGameCommand(name, argsFn(args), timeoutMs);
+      const response = await this.sendGameCommand(rec, name, argsFn(args), timeoutMs);
       if (response.error) return createErrorResponse(`${name} failed: ${response.error}`);
       return { content: [{ type: 'text', text: JSON.stringify(response, null, 2) }] };
     } catch (error: any) {
@@ -4174,36 +4376,107 @@ class GodotServer {
         );
       }
 
-      // Kill any existing process
-      if (this.activeProcess) {
-        this.logDebug('Killing existing Godot process before starting a new one');
-        this.disconnectFromGame();
-        if (this.gameConnection.projectPath) {
-          this.removeInteractionServer(this.gameConnection.projectPath);
-        }
-        this.activeProcess.process.kill();
+      // Name this game. An explicit name is validated and may replace whatever
+      // already runs under it; omitting one mints a fresh name — except in
+      // legacy pinned mode, where the sole existing game is replaced in place
+      // (a width-1 port window has nowhere to put a second game).
+      const requested = typeof args.game === 'string' ? args.game.trim() : '';
+      if (requested && !GodotServer.GAME_NAME_RE.test(requested)) {
+        return createErrorResponse(
+          `Invalid game name '${requested}'. Allowed: 1-64 chars of letters, digits, '-', '_'.`
+        );
       }
+      const gameName = requested
+        || (this.legacyPinned && this.games.size >= 1
+          ? (this.games.keys().next().value as string)
+          : this.mintGameName());
 
-      // Inject interaction server before launching
-      this.injectInteractionServer(args.projectPath);
+      // Pick the port and publish the record under one lock: two interleaved
+      // run_projects must not be able to probe the same free port and both
+      // take it. Everything that reads or writes this.games lives in here.
+      const claimPromise: Promise<{ rec?: GameRecord; err?: string }> = this.allocLock.then(async () => {
+        const oldRec = this.games.get(gameName);
 
-      // Pick a free port for this game instance unless the user pinned one via
-      // GODOT_MCP_PORT on the godot-mcp process itself. Inject the chosen port
-      // into the spawned game's environment so the autoload binds the matching
-      // port. This is what makes parallel Claude sessions safe — each spawns
-      // its own game on its own port without manual config.
-      if (!this.interactionPortLocked) {
-        const free = await this.findFreePort();
-        if (free !== null) {
-          if (free !== this.interactionPort) {
-            this.logDebug(`Auto-picked interaction port ${free} (was ${this.interactionPort})`);
-            this.interactionPort = free;
-          }
+        let port: number;
+        if (this.legacyPinned) {
+          // The pin is used verbatim and never probed — exactly as before.
+          port = this.portLo;
         } else {
-          console.error(`[SERVER] No free port in ${GodotServer.BASE_PORT}..${GodotServer.BASE_PORT + GodotServer.PORT_SCAN_RANGE - 1}, attempting with ${this.interactionPort} (likely to fail)`);
+          // A replacement gets a FRESH port. The outgoing process still holds
+          // its socket while the new game boots, and racing it buys nothing.
+          const free = await this.allocatePort(oldRec);
+          if (free === null) {
+            return { err: `No free port in ${this.portLo}-${this.portHi}. Stop a game or widen GODOT_MCP_PORT_RANGE.` };
+          }
+          port = free;
         }
-      }
-      const spawnEnv = { ...globalThis.process.env, GODOT_MCP_PORT: String(this.interactionPort) };
+
+        // Retire whatever holds this name BEFORE the new record is published:
+        // the old exit handler then fails its registry-identity guard, and its
+        // injection reference is already spent, so it can neither disconnect
+        // the new socket nor strip the fresh autoload mid-boot.
+        if (oldRec) {
+          this.logDebug(`Replacing game '${gameName}' (pid ${oldRec.pid ?? '?'}) before starting a new one`);
+          this.games.delete(gameName);
+          this.disconnectFromGame(oldRec);
+          if (oldRec.process) {
+            try {
+              oldRec.process.kill();
+            } catch (err) {
+              this.logDebug(`Kill of replaced game '${gameName}' failed: ${err}`);
+            }
+          }
+          this.releaseInjectionFor(oldRec);
+        }
+
+        const fresh: GameRecord = {
+          name: gameName,
+          status: 'starting',
+          projectPath: args.projectPath,
+          port,
+          process: null,
+          pid: null,
+          exitCode: null,
+          startedAt: Date.now(),
+          exitedAt: null,
+          output: [],
+          errors: [],
+          droppedOutput: 0,
+          droppedErrors: 0,
+          gamesStarted: 0,
+          lastRepro: null,
+          watchdogHits: 0,
+          portResolved: false,
+          socket: null,
+          connected: false,
+          responseBuffer: '',
+          pendingRequests: new Map(),
+          nextRequestId: 1,
+          lazyConnectPromise: null,
+          lastErrorIndex: 0,
+          lastLogIndex: 0,
+          injectionReleased: false,
+        };
+        this.games.set(gameName, fresh);
+        this.evictExitedRecords();
+        return { rec: fresh };
+      });
+      // Keep the lock chain alive even if the section above threw: a rejected
+      // allocLock would wedge every later run_project on this server.
+      this.allocLock = claimPromise.catch(() => undefined);
+      const claim = await claimPromise;
+      if (claim.err) return createErrorResponse(claim.err);
+      const rec = claim.rec!;
+
+      // Inject the interaction server before launching — after the outgoing
+      // record released its reference, so a project shared by several games
+      // keeps exactly one live injection.
+      this.acquireInjection(args.projectPath);
+
+      // The game's port is injected into its own environment so the autoload
+      // binds the matching port. This is what makes parallel games safe — each
+      // spawns on its own port without manual config.
+      const spawnEnv = { ...globalThis.process.env, GODOT_MCP_PORT: String(rec.port) };
 
       // `-d` attaches the local debugger, which parks the process at a `debug>`
       // prompt on a runtime script error — fatal for an interactive play session
@@ -4232,65 +4505,53 @@ class GodotServer {
       if (globalThis.process.env.GODOT_MCP_AUTO_PROFILE === '1'
           && cmdArgs.includes('--ai_vs_ai')
           && !cmdArgs.some(a => a.startsWith('--profile='))) {
-        cmdArgs.push(`--profile=mcp_${this.interactionPort}`);
+        cmdArgs.push(`--profile=mcp_${rec.port}`);
       }
 
-      this.logDebug(`Running Godot project: ${args.projectPath} on port ${this.interactionPort}`);
-      const process = spawn(this.godotPath!, cmdArgs, { stdio: 'pipe', env: spawnEnv });
+      this.logDebug(`Running Godot project: ${args.projectPath} as game '${rec.name}' on port ${rec.port}`);
+      let process: ReturnType<typeof spawn>;
+      try {
+        process = spawn(this.godotPath!, cmdArgs, { stdio: 'pipe', env: spawnEnv });
+      } catch (err) {
+        // The record was published before the spawn (so the data handlers can
+        // capture the very first line). A spawn that never produced a child
+        // must not leave a phantom game holding a name and a port.
+        if (this.games.get(rec.name) === rec) this.games.delete(rec.name);
+        this.releaseInjectionFor(rec);
+        throw err;
+      }
 
-      // Build the tracked-process record up front so the data handlers can
-      // mutate its bounded buffers + counters directly.
-      const ap: GodotProcess = {
-        process,
-        output: [],
-        errors: [],
-        droppedOutput: 0,
-        droppedErrors: 0,
-        gamesStarted: 0,
-        lastRepro: null,
-        watchdogHits: 0,
-        portResolved: false,
-      };
-      this.activeProcess = ap;
+      // The record was published before the spawn, so the data handlers below
+      // can mutate its bounded buffers + counters directly.
+      rec.process = process;
+      rec.pid = process.pid ?? null;
 
       process.stdout?.on('data', (data: Buffer) => {
-        this.appendOutputLines(ap, data.toString().split('\n'));
+        this.appendOutputLines(rec, data.toString().split('\n'));
       });
 
       process.stderr?.on('data', (data: Buffer) => {
-        this.appendErrorLines(ap, data.toString().split('\n'));
+        this.appendErrorLines(rec, data.toString().split('\n'));
       });
 
       process.on('exit', (code: number | null) => {
-        this.logDebug(`Godot process exited with code ${code}`);
-        // Only tear down when the exiting process is still the tracked one.
-        // A replacement run_project already disconnected and cleaned up the
-        // old game synchronously before spawning; letting this stale handler
-        // run unconditionally would disconnect the NEW game's socket and
-        // strip its injected autoload mid-boot.
-        if (this.activeProcess && this.activeProcess.process === process) {
-          this.disconnectFromGame();
-          if (this.gameConnection.projectPath) {
-            this.removeInteractionServer(this.gameConnection.projectPath);
-            this.gameConnection.projectPath = null;
-          }
-          this.activeProcess = null;
-        }
+        this.logDebug(`Godot process for game '${rec.name}' exited with code ${code}`);
+        // markExited() only fires when this record still holds its name. A
+        // replacement run_project already retired it synchronously before
+        // spawning; letting this stale handler run unconditionally would
+        // disconnect the NEW game's socket and strip its autoload mid-boot.
+        this.markExited(rec, code);
       });
 
       process.on('error', (err: Error) => {
         console.error('Failed to start Godot process:', err);
-        if (this.activeProcess && this.activeProcess.process === process) {
-          this.activeProcess = null;
-        }
+        this.markExited(rec, null);
       });
-
-      // activeProcess was assigned above (before the data handlers were wired).
 
       // Start the async TCP connection to the interaction server. Kept as a
       // captured promise so waitForReady can join it; otherwise it stays
       // fire-and-forget exactly as before.
-      const connectPromise = this.connectToGame(args.projectPath)
+      const connectPromise = this.connectToGame(rec)
         .catch((err) => { this.logDebug(`connectToGame failed: ${err}`); return false; });
 
       if (args.waitForReady === true) {
@@ -4300,7 +4561,7 @@ class GodotServer {
         let probeOk = false;
         if (connected) {
           try {
-            const probe = await this.sendGameCommand('get_performance', {}, 8000);
+            const probe = await this.sendGameCommand(rec, 'get_performance', {}, 8000);
             probeOk = !probe?.error;
           } catch (err) {
             this.logDebug(`waitForReady probe failed: ${err}`);
@@ -4314,7 +4575,8 @@ class GodotServer {
               text: JSON.stringify(
                 {
                   message: 'Godot project started',
-                  port: this.interactionPort,
+                  game: rec.name,
+                  port: rec.port,
                   connected,
                   probeOk,
                   argv: cmdArgs,
@@ -4327,11 +4589,33 @@ class GodotServer {
         };
       }
 
+      // A legacy pinned server that was called the old way (no `game`) answers
+      // in the old words — skills and probers match these bytes.
+      if (this.legacyPinned && !requested) {
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `Godot project started${args.debug === false ? ' without the local debugger' : ' in debug mode'}. Use get_debug_output to see output. Game interaction server connecting on port ${rec.port}...`,
+            },
+          ],
+        };
+      }
+
       return {
         content: [
           {
             type: 'text',
-            text: `Godot project started${args.debug === false ? ' without the local debugger' : ' in debug mode'}. Use get_debug_output to see output. Game interaction server connecting on port ${this.interactionPort}...`,
+            text: JSON.stringify(
+              {
+                message: 'Godot project started',
+                game: rec.name,
+                port: rec.port,
+                argv: cmdArgs,
+              },
+              null,
+              2
+            ),
           },
         ],
       };
@@ -4347,63 +4631,73 @@ class GodotServer {
    * Append stdout lines to the bounded output buffer, tracking the bound port
    * and the per-game [REPRO] markers as they stream by.
    */
-  private appendOutputLines(ap: GodotProcess, lines: string[]): void {
+  private appendOutputLines(rec: GameRecord, lines: string[]): void {
     const listeningRegex = /McpInteractionServer: Listening on 127\.0\.0\.1:(\d+)/;
     for (const line of lines) {
-      ap.output.push(line);
+      rec.output.push(line);
       if (DEBUG_MODE && line.trim()) this.logDebug(`[Godot stdout] ${line}`);
-      if (!ap.portResolved) {
+      if (!rec.portResolved) {
         const m = listeningRegex.exec(line);
         if (m) {
-          ap.portResolved = true;
+          rec.portResolved = true;
           const actual = parseInt(m[1], 10);
-          if (!Number.isNaN(actual) && actual !== this.interactionPort) {
-            console.error(`[SERVER] Game bound port ${actual}, updating from ${this.interactionPort}`);
-            this.interactionPort = actual;
+          if (!Number.isNaN(actual) && actual !== rec.port) {
+            console.error(`[SERVER] Game '${rec.name}' bound port ${actual}, updating from ${rec.port}`);
+            // The autoload landing on someone else's port means two games now
+            // answer on one socket — unrecoverable from here, but the operator
+            // needs to know which two.
+            const clash = [...this.games.values()].find(g => g !== rec && g.status !== 'exited' && g.port === actual);
+            if (clash) {
+              console.error(`[SERVER] WARNING: port ${actual} is already game '${clash.name}' — the two games will fight over one interaction server.`);
+            }
+            rec.port = actual;
           }
         }
       }
       // Each game prints a "[REPRO] board=.. ai0=.. ai1=.." line at startup.
       if (line.includes('[REPRO]')) {
-        ap.gamesStarted++;
-        ap.lastRepro = line.trim();
+        rec.gamesStarted++;
+        rec.lastRepro = line.trim();
       }
       // Watchdog trips survive the reboot that clears the game-side counter, so
       // count them here for the whole process lifetime.
       if (line.includes('WATCHDOG')) {
-        ap.watchdogHits++;
+        rec.watchdogHits++;
       }
     }
-    this.trimBuffer('output');
+    this.trimBuffer(rec, 'output');
   }
 
   /** Append stderr lines to the bounded error buffer. */
-  private appendErrorLines(ap: GodotProcess, lines: string[]): void {
+  private appendErrorLines(rec: GameRecord, lines: string[]): void {
     for (const line of lines) {
-      ap.errors.push(line);
+      rec.errors.push(line);
       if (DEBUG_MODE && line.trim()) this.logDebug(`[Godot stderr] ${line}`);
     }
-    this.trimBuffer('errors');
+    this.trimBuffer(rec, 'errors');
   }
 
   /**
    * Evict the oldest lines once a buffer exceeds MAX_BUFFER_LINES, and rebase
-   * the consumer cursor (lastLogIndex/lastErrorIndex) so game_get_logs /
-   * game_get_errors still return only genuinely-new lines after a trim.
+   * that record's consumer cursor (lastLogIndex/lastErrorIndex) so
+   * game_get_logs / game_get_errors still return only genuinely-new lines
+   * after a trim.
+   *
+   * The record is passed in rather than looked up: a dying process's late
+   * stdout must trim its OWN buffer and rebase its OWN cursors, never those of
+   * whichever game happens to be current.
    */
-  private trimBuffer(stream: 'output' | 'errors'): void {
-    const ap = this.activeProcess;
-    if (!ap) return;
-    const arr = stream === 'output' ? ap.output : ap.errors;
+  private trimBuffer(rec: GameRecord, stream: 'output' | 'errors'): void {
+    const arr = stream === 'output' ? rec.output : rec.errors;
     const overflow = arr.length - MAX_BUFFER_LINES;
     if (overflow <= 0) return;
     arr.splice(0, overflow);
     if (stream === 'output') {
-      ap.droppedOutput += overflow;
-      this.lastLogIndex = Math.max(0, this.lastLogIndex - overflow);
+      rec.droppedOutput += overflow;
+      rec.lastLogIndex = Math.max(0, rec.lastLogIndex - overflow);
     } else {
-      ap.droppedErrors += overflow;
-      this.lastErrorIndex = Math.max(0, this.lastErrorIndex - overflow);
+      rec.droppedErrors += overflow;
+      rec.lastErrorIndex = Math.max(0, rec.lastErrorIndex - overflow);
     }
   }
 
@@ -4413,12 +4707,9 @@ class GodotServer {
    * size (the buffers themselves are already capped at MAX_BUFFER_LINES).
    */
   private async handleGetDebugOutput(args?: any) {
-    if (!this.activeProcess) {
-      return createErrorResponse(
-        'No active Godot process.'
-      );
-    }
-    const ap = this.activeProcess;
+    const resolved = this.resolveGame(args, 'No active Godot process.');
+    if (resolved.err) return createErrorResponse(resolved.err);
+    const rec = resolved.rec!;
     const tail = Math.max(1, Math.min(2000, Number(args?.tail) || 200));
     return {
       content: [
@@ -4426,16 +4717,19 @@ class GodotServer {
           type: 'text',
           text: JSON.stringify(
             {
-              gamesStarted: ap.gamesStarted,
-              lastRepro: ap.lastRepro,
-              watchdogHits: ap.watchdogHits,
-              bufferedOutputLines: ap.output.length,
-              bufferedErrorLines: ap.errors.length,
-              droppedOutputLines: ap.droppedOutput,
-              droppedErrorLines: ap.droppedErrors,
+              game: rec.name,
+              status: rec.status,
+              exitCode: rec.exitCode,
+              gamesStarted: rec.gamesStarted,
+              lastRepro: rec.lastRepro,
+              watchdogHits: rec.watchdogHits,
+              bufferedOutputLines: rec.output.length,
+              bufferedErrorLines: rec.errors.length,
+              droppedOutputLines: rec.droppedOutput,
+              droppedErrorLines: rec.droppedErrors,
               tail,
-              output: ap.output.slice(-tail),
-              errors: ap.errors.slice(-tail),
+              output: rec.output.slice(-tail),
+              errors: rec.errors.slice(-tail),
             },
             null,
             2
@@ -4451,27 +4745,30 @@ class GodotServer {
    * the game is busy). Answers "how many games have run / where are we / how
    * noisy is it" from data the bridge already captured off stdout.
    */
-  private async handleGameStatus() {
-    if (!this.activeProcess) {
-      return createErrorResponse('No active Godot process. Use run_project first.');
-    }
-    const ap = this.activeProcess;
+  private async handleGameStatus(args?: any) {
+    const resolved = this.resolveGame(args, 'No active Godot process. Use run_project first.');
+    if (resolved.err) return createErrorResponse(resolved.err);
+    const rec = resolved.rec!;
     return {
       content: [
         {
           type: 'text',
           text: JSON.stringify(
             {
-              running: true,
-              connectedToGame: this.gameConnection?.connected ?? false,
-              interactionPort: this.interactionPort,
-              gamesStarted: ap.gamesStarted,
-              lastRepro: ap.lastRepro,
-              watchdogHits: ap.watchdogHits,
-              bufferedOutputLines: ap.output.length,
-              bufferedErrorLines: ap.errors.length,
-              droppedOutputLines: ap.droppedOutput,
-              droppedErrorLines: ap.droppedErrors,
+              running: rec.status !== 'exited',
+              connectedToGame: rec.connected,
+              interactionPort: rec.port,
+              game: rec.name,
+              status: rec.status,
+              pid: rec.pid,
+              exitCode: rec.exitCode,
+              gamesStarted: rec.gamesStarted,
+              lastRepro: rec.lastRepro,
+              watchdogHits: rec.watchdogHits,
+              bufferedOutputLines: rec.output.length,
+              bufferedErrorLines: rec.errors.length,
+              droppedOutputLines: rec.droppedOutput,
+              droppedErrorLines: rec.droppedErrors,
               bufferCap: MAX_BUFFER_LINES,
             },
             null,
@@ -4486,26 +4783,26 @@ class GodotServer {
    * Handle the clear_debug_output tool — drop the captured stdout/stderr lines
    * and reset the consumer cursors without restarting the game. Preserves the
    * cumulative gamesStarted / lastRepro counters (those describe the run, not
-   * the buffer). Lets a long session reclaim memory mid-flight.
+   * the buffer). Lets a long session reclaim memory mid-flight, and works on
+   * an exited record whose forensics have been read.
    */
-  private async handleClearDebugOutput() {
-    if (!this.activeProcess) {
-      return createErrorResponse('No active Godot process. Use run_project first.');
-    }
-    const ap = this.activeProcess;
-    const cleared = ap.output.length + ap.errors.length;
-    ap.output.length = 0;
-    ap.errors.length = 0;
-    ap.droppedOutput = 0;
-    ap.droppedErrors = 0;
-    this.lastLogIndex = 0;
-    this.lastErrorIndex = 0;
+  private async handleClearDebugOutput(args?: any) {
+    const resolved = this.resolveGame(args, 'No active Godot process. Use run_project first.');
+    if (resolved.err) return createErrorResponse(resolved.err);
+    const rec = resolved.rec!;
+    const cleared = rec.output.length + rec.errors.length;
+    rec.output.length = 0;
+    rec.errors.length = 0;
+    rec.droppedOutput = 0;
+    rec.droppedErrors = 0;
+    rec.lastLogIndex = 0;
+    rec.lastErrorIndex = 0;
     return {
       content: [
         {
           type: 'text',
           text: JSON.stringify(
-            { message: 'Debug buffers cleared', clearedLines: cleared, gamesStarted: ap.gamesStarted },
+            { message: 'Debug buffers cleared', game: rec.name, clearedLines: cleared, gamesStarted: rec.gamesStarted },
             null,
             2
           ),
@@ -4517,30 +4814,67 @@ class GodotServer {
   /**
    * Handle the stop_project tool
    */
-  private async handleStopProject() {
-    // Snapshot the record up front: the child's own 'exit' handler nulls
-    // this.activeProcess, and it can fire while we await below.
-    const ap = this.activeProcess;
-    if (!ap) {
-      return createErrorResponse(
-        'No active Godot process to stop.'
-      );
+  private async handleStopProject(args?: any) {
+    // Snapshot the record up front: the child's own 'exit' handler can retire
+    // it (and, in legacy pinned mode, delete it) while we await below.
+    const resolved = this.resolveGame(args, 'No active Godot process to stop.');
+    if (resolved.err) return createErrorResponse(resolved.err);
+    const rec = resolved.rec!;
+
+    // Return only a bounded tail. The buffers are already capped, but even
+    // MAX_BUFFER_LINES of a noisy game is large; the last ~80 lines are what
+    // matters at shutdown (crash backtrace, final state), and the full set is
+    // never useful enough to justify a multi-MB tool result.
+    const STOP_TAIL = 80;
+    const finalReport = (exitConfirmed: boolean, escalated: boolean) => ({
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(
+            {
+              message: 'Godot project stopped',
+              game: rec.name,
+              exitConfirmed,
+              escalated,
+              exitCode: rec.exitCode,
+              totalOutputLines: rec.output.length,
+              totalErrorLines: rec.errors.length,
+              droppedOutputLines: rec.droppedOutput,
+              droppedErrorLines: rec.droppedErrors,
+              finalOutput: rec.output.slice(-STOP_TAIL),
+              finalErrors: rec.errors.slice(-STOP_TAIL),
+            },
+            null,
+            2
+          ),
+        },
+      ],
+    });
+
+    // Already dead (a retained corpse, or a record whose process never came
+    // up): nothing to kill, so hand back the retained tail and drop the record.
+    if (rec.status === 'exited' || !rec.process) {
+      this.logDebug(`Dropping exited game '${rec.name}'`);
+      if (this.games.get(rec.name) === rec) this.games.delete(rec.name);
+      this.releaseInjectionFor(rec);
+      return finalReport(true, false);
     }
 
-    this.logDebug('Stopping active Godot process');
-    this.disconnectFromGame();
+    this.logDebug(`Stopping Godot process for game '${rec.name}'`);
+    this.disconnectFromGame(rec);
 
     // Register the exit listener BEFORE kill() — a process that dies
     // immediately would otherwise emit 'exit' before we are listening.
     const STOP_EXIT_TIMEOUT_MS = 2000;
-    const exitPromise = new Promise<boolean>(resolve => {
+    const proc = rec.process;
+    const waitForExit = () => new Promise<boolean>(resolve => {
       let settled = false;
       const timer = setTimeout(() => {
         if (settled) return;
         settled = true;
         resolve(false);
       }, STOP_EXIT_TIMEOUT_MS);
-      ap.process.once('exit', () => {
+      proc.once('exit', () => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
@@ -4548,57 +4882,43 @@ class GodotServer {
       });
     });
 
-    ap.process.kill();
+    const exitPromise = waitForExit();
+    proc.kill();
 
     // Give the process a brief window to actually die so the caller knows
-    // whether it is really gone. No SIGKILL escalation, no waiting past 2s.
-    const exitConfirmed = await exitPromise;
+    // whether it is really gone.
+    let exitConfirmed = await exitPromise;
+    let escalated = false;
     if (!exitConfirmed) {
-      this.logDebug('Godot process did not exit within 2s of SIGTERM');
+      // SIGTERM bounced. Escalate once rather than leave an orphan holding the
+      // port — a leaked port is a game that can never be booted again in this
+      // window. kill() can throw on an already-dead handle on Windows.
+      this.logDebug('Godot process did not exit within 2s of SIGTERM, escalating to SIGKILL');
+      escalated = true;
+      const killPromise = waitForExit();
+      try {
+        proc.kill('SIGKILL');
+      } catch (err) {
+        this.logDebug(`SIGKILL of game '${rec.name}' failed: ${err}`);
+      }
+      exitConfirmed = await killPromise;
+      if (!exitConfirmed) {
+        this.logDebug('Godot process did not exit within 2s of SIGKILL either');
+      }
     }
 
-    const output = ap.output;
-    const errors = ap.errors;
-    const droppedOutputLines = ap.droppedOutput;
-    const droppedErrorLines = ap.droppedErrors;
-    if (this.activeProcess === ap) {
-      this.activeProcess = null;
-    }
-    this.lastErrorIndex = 0;
-    this.lastLogIndex = 0;
+    // Drop the record whether or not the exit handler already retired it
+    // (legacy mode deletes on exit; ranged mode retains). Guarded so a
+    // run_project that replaced this name while we waited keeps its record.
+    if (this.games.get(rec.name) === rec) this.games.delete(rec.name);
+    rec.lastErrorIndex = 0;
+    rec.lastLogIndex = 0;
 
-    // Remove injected interaction server
-    if (this.gameConnection.projectPath) {
-      this.removeInteractionServer(this.gameConnection.projectPath);
-      this.gameConnection.projectPath = null;
-    }
+    // Remove injected interaction server (a no-op if the exit handler, which
+    // may have fired mid-wait, already released this record's reference).
+    this.releaseInjectionFor(rec);
 
-    // Return only a bounded tail. The buffers are already capped, but even
-    // MAX_BUFFER_LINES of a noisy game is large; the last ~80 lines are what
-    // matters at shutdown (crash backtrace, final state), and the full set is
-    // never useful enough to justify a multi-MB tool result.
-    const STOP_TAIL = 80;
-    return {
-      content: [
-        {
-          type: 'text',
-          text: JSON.stringify(
-            {
-              message: 'Godot project stopped',
-              exitConfirmed,
-              totalOutputLines: output.length,
-              totalErrorLines: errors.length,
-              droppedOutputLines,
-              droppedErrorLines,
-              finalOutput: output.slice(-STOP_TAIL),
-              finalErrors: errors.slice(-STOP_TAIL),
-            },
-            null,
-            2
-          ),
-        },
-      ],
-    };
+    return finalReport(exitConfirmed, escalated);
   }
 
   /**
@@ -5282,16 +5602,17 @@ class GodotServer {
   /**
    * Handle the game_screenshot tool
    */
-  private async handleGameScreenshot() {
-    if (!this.activeProcess) {
-      return createErrorResponse('No active Godot process. Use run_project first.');
-    }
-    if (!(await this.ensureGameConnection())) {
+  private async handleGameScreenshot(args?: any) {
+    const resolved = this.resolveGame(args, 'No active Godot process. Use run_project first.');
+    if (resolved.err) return createErrorResponse(resolved.err);
+    const rec = resolved.rec!;
+    if (rec.status === 'exited') return createErrorResponse(this.exitedGameError(rec));
+    if (!(await this.ensureGameConnection(rec))) {
       return createErrorResponse('Not connected to game interaction server. Wait a moment and try again.');
     }
 
     try {
-      const response = await this.sendGameCommand('screenshot');
+      const response = await this.sendGameCommand(rec, 'screenshot');
       if (response.error) {
         return createErrorResponse(`Screenshot failed: ${response.error}`);
       }
@@ -5916,19 +6237,23 @@ class GodotServer {
 
   // --- Error/Log capture handlers ---
 
-  private async handleGameGetErrors() {
-    if (!this.activeProcess)
-      return createErrorResponse('No active Godot process. Use run_project first.');
-    const errors = this.activeProcess.errors.slice(this.lastErrorIndex);
-    this.lastErrorIndex = this.activeProcess.errors.length;
+  // Cursors live on the record, so draining one game's errors never advances
+  // another's — and a dead game's tail stays readable for forensics.
+  private async handleGameGetErrors(args?: any) {
+    const resolved = this.resolveGame(args, 'No active Godot process. Use run_project first.');
+    if (resolved.err) return createErrorResponse(resolved.err);
+    const rec = resolved.rec!;
+    const errors = rec.errors.slice(rec.lastErrorIndex);
+    rec.lastErrorIndex = rec.errors.length;
     return { content: [{ type: 'text', text: JSON.stringify({ count: errors.length, errors }, null, 2) }] };
   }
 
-  private async handleGameGetLogs() {
-    if (!this.activeProcess)
-      return createErrorResponse('No active Godot process. Use run_project first.');
-    const logs = this.activeProcess.output.slice(this.lastLogIndex);
-    this.lastLogIndex = this.activeProcess.output.length;
+  private async handleGameGetLogs(args?: any) {
+    const resolved = this.resolveGame(args, 'No active Godot process. Use run_project first.');
+    if (resolved.err) return createErrorResponse(resolved.err);
+    const rec = resolved.rec!;
+    const logs = rec.output.slice(rec.lastLogIndex);
+    rec.lastLogIndex = rec.output.length;
     return { content: [{ type: 'text', text: JSON.stringify({ count: logs.length, logs }, null, 2) }] };
   }
 
