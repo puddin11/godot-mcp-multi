@@ -1087,6 +1087,14 @@ describe('Lifecycle handlers', () => {
     expect(sourceCode).toContain('--profile=mcp_');
   });
 
+  it('run_project diverts a profiled boot\'s engine log under its profile dir', () => {
+    // Any --profile (auto or explicit) pairs with --log-file unless the caller
+    // passed one; the path must be what UserPaths.engine_log_path resolves.
+    expect(sourceCode).toContain("!cmdArgs.includes('--log-file')");
+    expect(sourceCode).toContain('`user://profiles/${profileName}/godot.log`');
+    expect(sourceCode).toContain("replace(/[^A-Za-z0-9_-]/g, '')");
+  });
+
   it('run_project supports waitForReady with a cheap probe round-trip', () => {
     expect(sourceCode).toContain('waitForReady');
     expect(sourceCode).toContain("args.waitForReady === true");

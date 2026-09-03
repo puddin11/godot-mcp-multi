@@ -4578,6 +4578,23 @@ class GodotServer {
         cmdArgs.push(`--profile=mcp_${rec.port}`);
       }
 
+      // The engine's own logs/godot.log is the one user:// path --profile
+      // cannot move (its logger exists before any script runs), and N
+      // processes sharing it tear and NUL-hole each other's lines
+      // (deckbuilder #308). A profiled boot therefore also gets its engine log
+      // under the profile dir; the game reads it back from the same path by
+      // convention (UserPaths.engine_log_path), so the name is sanitized the
+      // way UserPaths._sanitize does — [A-Za-z0-9_-], at most 32 chars.
+      const profileArg = cmdArgs.find(a => a.startsWith('--profile='));
+      if (profileArg && !cmdArgs.includes('--log-file')) {
+        const profileName = profileArg.slice('--profile='.length)
+          .replace(/[^A-Za-z0-9_-]/g, '')
+          .slice(0, 32);
+        if (profileName.length > 0) {
+          cmdArgs.push('--log-file', `user://profiles/${profileName}/godot.log`);
+        }
+      }
+
       this.logDebug(`Running Godot project: ${args.projectPath} as game '${rec.name}' on port ${rec.port}`);
       let process: ReturnType<typeof spawn>;
       try {
