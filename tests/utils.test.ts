@@ -7,6 +7,7 @@ import {
   validatePath,
   createErrorResponse,
   isGodot44OrLater,
+  summarizeErrorLines,
 } from '../src/utils.js';
 
 describe('PARAMETER_MAPPINGS', () => {
@@ -223,5 +224,35 @@ describe('isGodot44OrLater', () => {
   it('handles version strings with extra info', () => {
     expect(isGodot44OrLater('4.4.1.stable')).toBe(true);
     expect(isGodot44OrLater('4.3.2.rc1')).toBe(false);
+  });
+});
+
+describe('summarizeErrorLines', () => {
+  // One stderr chunk per message line, each ending in a newline: the buffer holds a blank
+  // entry after every line, as the stop payloads of the overnight fleet showed (24 for 12).
+  const warn = (msg: string, at: string) => [`WARNING: ${msg}\r`, '', `   at: ${at}\r`, ''];
+
+  it('counts each message once with its at: line, skipping blank entries', () => {
+    const lines = [
+      ...warn('The parameter "view" is never used.', 'GDScript::reload (res://lib/AiShopValue.gd:602)'),
+      ...warn('Values of the ternary operator are not mutually compatible.', 'GDScript::reload (res://lib/ServerAiSeatHost.gd:121)'),
+      ...warn('The parameter "view" is never used.', 'GDScript::reload (res://lib/AiShopValue.gd:602)'),
+    ];
+    const s = summarizeErrorLines(lines);
+    expect(lines.length).toBe(12);
+    expect(s.lines).toBe(6);
+    expect(s.dropped).toBe(0);
+    expect(s.messages).toEqual([
+      { first: 'WARNING: The parameter "view" is never used.', at: 'GDScript::reload (res://lib/AiShopValue.gd:602)', n: 2 },
+      { first: 'WARNING: Values of the ternary operator are not mutually compatible.', at: 'GDScript::reload (res://lib/ServerAiSeatHost.gd:121)', n: 1 },
+    ]);
+  });
+
+  it('keys a message without an at: line on its first line, and caps the list', () => {
+    const lines = ['ERROR: boom', '', 'ERROR: boom', 'ERROR: other', '   GDScript backtrace (most recent call first):', '       [0] _ready (res://x.gd:3)'];
+    const s = summarizeErrorLines(lines, 1);
+    expect(s.lines).toBe(5);
+    expect(s.messages).toEqual([{ first: 'ERROR: boom', n: 2 }]);
+    expect(s.dropped).toBe(1);
   });
 });

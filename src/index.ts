@@ -34,6 +34,7 @@ import {
   isGodot44OrLater,
   parseGodotScriptDiagnostics,
   collectGdPaths,
+  summarizeErrorLines,
   type OperationParams,
 } from './utils.js';
 
@@ -4913,30 +4914,38 @@ class GodotServer {
     // matters at shutdown (crash backtrace, final state), and the full set is
     // never useful enough to justify a multi-MB tool result.
     const STOP_TAIL = 80;
-    const finalReport = (exitConfirmed: boolean, escalated: boolean) => ({
-      content: [
-        {
-          type: 'text',
-          text: JSON.stringify(
-            {
-              message: 'Godot project stopped',
-              game: rec.name,
-              exitConfirmed,
-              escalated,
-              exitCode: rec.exitCode,
-              totalOutputLines: rec.output.length,
-              totalErrorLines: rec.errors.length,
-              droppedOutputLines: rec.droppedOutput,
-              droppedErrorLines: rec.droppedErrors,
-              finalOutput: rec.output.slice(-STOP_TAIL),
-              finalErrors: rec.errors.slice(-STOP_TAIL),
-            },
-            null,
-            2
-          ),
-        },
-      ],
-    });
+    const finalReport = (exitConfirmed: boolean, escalated: boolean) => {
+      // totalErrorLines keeps its old meaning (buffer entries, blank ones included);
+      // the summary is the buffer's distinct messages, each with its count.
+      const summary = summarizeErrorLines(rec.errors);
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(
+              {
+                message: 'Godot project stopped',
+                game: rec.name,
+                exitConfirmed,
+                escalated,
+                exitCode: rec.exitCode,
+                totalOutputLines: rec.output.length,
+                totalErrorLines: rec.errors.length,
+                errorLines: summary.lines,
+                errorMessages: summary.messages,
+                errorMessagesDropped: summary.dropped,
+                droppedOutputLines: rec.droppedOutput,
+                droppedErrorLines: rec.droppedErrors,
+                finalOutput: rec.output.slice(-STOP_TAIL),
+                finalErrors: rec.errors.slice(-STOP_TAIL),
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    };
 
     // Already dead (a retained corpse, or a record whose process never came
     // up): nothing to kill, so hand back the retained tail and drop the record.

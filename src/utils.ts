@@ -279,3 +279,47 @@ export function collectGdPaths(outputs: string[]): string[] {
   }
   return result;
 }
+
+export interface ErrorMessageCount {
+  first: string;
+  at?: string;
+  n: number;
+}
+
+/**
+ * Group a stderr buffer into messages and count each one: a message is a line that is not
+ * indented plus the indented lines under it (Godot's `   at: ...`, a GDScript backtrace), keyed
+ * by its first line and first `at:`. Blank entries are skipped: every stderr chunk that ends in
+ * a newline splits into one, so a buffer's length runs about twice its real line count.
+ */
+export function summarizeErrorLines(
+  lines: string[],
+  cap = 20
+): { messages: ErrorMessageCount[]; lines: number; dropped: number } {
+  const counts = new Map<string, ErrorMessageCount>();
+  let nonBlank = 0;
+  let current: { first: string; at?: string } | null = null;
+  const flush = () => {
+    if (!current) return;
+    const key = current.first + '\u0000' + (current.at ?? '');
+    const seen = counts.get(key);
+    if (seen) seen.n++;
+    else counts.set(key, { first: current.first, ...(current.at !== undefined ? { at: current.at } : {}), n: 1 });
+    current = null;
+  };
+  for (const raw of lines) {
+    const line = raw.replace(/\r$/, '');
+    if (!line.trim()) continue;
+    nonBlank++;
+    if (/^\s/.test(line) && current) {
+      const body = line.trim();
+      if (current.at === undefined && body.startsWith('at:')) current.at = body.slice(3).trim();
+      continue;
+    }
+    flush();
+    current = { first: line.trim() };
+  }
+  flush();
+  const messages = [...counts.values()];
+  return { messages: messages.slice(0, cap), lines: nonBlank, dropped: Math.max(0, messages.length - cap) };
+}
